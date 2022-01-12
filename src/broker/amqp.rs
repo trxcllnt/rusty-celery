@@ -5,7 +5,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
-    QueueDeclareOptions,
+    BasicRejectOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldArray, FieldTable};
 use lapin::uri::{self, AMQPUri};
@@ -218,8 +218,12 @@ impl Broker for AMQPBroker {
             .map_err(|e| e.into())
     }
 
-    async fn nack(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
-        Ok(())
+    async fn nack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        delivery
+            .1
+            .reject(BasicRejectOptions::default())
+            .await
+            .map_err(|e| e.into())
     }
 
     async fn retry(
@@ -227,12 +231,7 @@ impl Broker for AMQPBroker {
         delivery: &Self::Delivery,
         eta: Option<DateTime<Utc>>,
     ) -> Result<(), BrokerError> {
-        let mut headers = delivery
-            .1
-            .properties
-            .headers()
-            .clone()
-            .unwrap_or_else(FieldTable::default);
+        let mut headers = delivery.1.properties.headers().clone().unwrap_or_default();
 
         // Increment the number of retries.
         let retries = match get_header_u32(&headers, "retries") {
