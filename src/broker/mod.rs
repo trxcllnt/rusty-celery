@@ -65,6 +65,9 @@ pub trait Broker: Send + Sync + Sized {
     /// Acknowledge a [`Delivery`](trait.Broker.html#associatedtype.Delivery) for deletion.
     async fn ack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError>;
 
+    /// Negative acknowledge a [`Delivery`](trait.Broker.html#associatedtype.Delivery) for requeue.
+    async fn nack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError>;
+
     /// Retry a delivery.
     async fn retry(
         &self,
@@ -88,6 +91,11 @@ pub trait Broker: Send + Sync + Sized {
 
     /// Try reconnecting in the event of some sort of connection error.
     async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError>;
+
+    /// Callback used to notify that a certain task's message was processed
+    fn on_message_processed(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        Ok(())
+    }
 }
 
 /// A [`BrokerBuilder`] is used to create a type of broker with a custom configuration.

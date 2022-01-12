@@ -115,6 +115,8 @@ mod codegen;
 /// - `max_retry_delay`: Set a task-level [`TaskOptions::max_retry_delay`](task/struct.TaskOptions.html#structfield.max_retry_delay).
 /// - `retry_for_unexpected`: Set a task-level [`TaskOptions::retry_for_unexpected`](task/struct.TaskOptions.html#structfield.retry_for_unexpected).
 /// - `acks_late`: Set a task-level [`TaskOptions::acks_late`](task/struct.TaskOptions.html#structfield.acks_late).
+/// - `acks_on_failure_or_timeout`: Set a task-level [`TaskOptions::acks_on_failure_or_timeout`](task/struct.TaskOptions.html#structfield.acks_on_failure_or_timeout).
+/// - `nacks_enabled`: Set a task-level [`TaskOptions::nacks_enabled`](task/struct.TaskOptions.html#structfield.nacks_enabled).
 /// - `content_type`: Set a task-level [`TaskOptions::content_type`](task/struct.TaskOptions.html#structfield.content_type).
 /// - `bind`: A bool. If true, the task will be run like an instance method and so the function's
 /// first argument should be a reference to `Self`. Note however that Rust won't allow you to call

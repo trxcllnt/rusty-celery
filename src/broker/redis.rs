@@ -322,6 +322,10 @@ impl Broker for RedisBroker {
         Ok(())
     }
 
+    async fn nack(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
     /// Retry a delivery.
     async fn retry(
         &self,

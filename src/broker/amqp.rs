@@ -218,6 +218,10 @@ impl Broker for AMQPBroker {
             .map_err(|e| e.into())
     }
 
+    async fn nack(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
     async fn retry(
         &self,
         delivery: &Self::Delivery,

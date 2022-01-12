@@ -98,6 +98,8 @@ impl Task for MultiplyTask {
         max_retry_delay: None,
         retry_for_unexpected: None,
         acks_late: None,
+        acks_on_failure_or_timeout: None,
+        nacks_enabled: None,
         content_type: None,
     };
 

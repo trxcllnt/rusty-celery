@@ -14,7 +14,7 @@ mod request;
 mod signature;
 
 pub use async_result::AsyncResult;
-pub use options::TaskOptions;
+pub use options::{TaskOptions, TaskOptionsConcreteDefault};
 pub use request::Request;
 pub use signature::Signature;
 
@@ -57,6 +57,8 @@ pub trait Task: Send + Sync + std::marker::Sized {
         max_retry_delay: None,
         retry_for_unexpected: None,
         acks_late: None,
+        acks_on_failure_or_timeout: None,
+        nacks_enabled: None,
         content_type: None,
     };
 
@@ -187,21 +189,35 @@ pub trait Task: Send + Sync + std::marker::Sized {
         Self::DEFAULTS
             .min_retry_delay
             .or(self.options().min_retry_delay)
-            .unwrap_or(0)
+            .unwrap_or_else(TaskOptionsConcreteDefault::min_retry_delay)
     }
 
     fn max_retry_delay(&self) -> u32 {
         Self::DEFAULTS
             .max_retry_delay
             .or(self.options().max_retry_delay)
-            .unwrap_or(3600)
+            .unwrap_or_else(TaskOptionsConcreteDefault::max_retry_delay)
     }
 
     fn acks_late(&self) -> bool {
         Self::DEFAULTS
             .acks_late
             .or(self.options().acks_late)
-            .unwrap_or(false)
+            .unwrap_or_else(TaskOptionsConcreteDefault::acks_late)
+    }
+
+    fn acks_on_failure_or_timeout(&self) -> bool {
+        Self::DEFAULTS
+            .acks_on_failure_or_timeout
+            .or(self.options().acks_on_failure_or_timeout)
+            .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout)
+    }
+
+    fn nacks_enabled(&self) -> bool {
+        Self::DEFAULTS
+            .nacks_enabled
+            .or(self.options().nacks_enabled)
+            .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled)
     }
 }
 

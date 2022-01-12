@@ -94,6 +94,10 @@ impl Broker for MockBroker {
         Ok(())
     }
 
+    async fn nack(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
     #[allow(unused)]
     async fn retry(
         &self,

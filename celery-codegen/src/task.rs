@@ -28,6 +28,8 @@ enum TaskAttr {
     ContentType(syn::Ident),
     RetryForUnexpected(syn::LitBool),
     AcksLate(syn::LitBool),
+    AcksOnFailureOrTimeout(syn::LitBool),
+    NacksEnabled(syn::LitBool),
     Bind(syn::LitBool),
     OnFailure(syn::Ident),
     OnSuccess(syn::Ident),
@@ -47,6 +49,8 @@ struct Task {
     max_retry_delay: Option<syn::LitInt>,
     retry_for_unexpected: Option<syn::LitBool>,
     acks_late: Option<syn::LitBool>,
+    acks_on_failure_or_timeout: Option<syn::LitBool>,
+    nacks_enabled: Option<syn::LitBool>,
     content_type: Option<syn::Ident>,
     original_args: Vec<syn::FnArg>,
     inputs: Option<Punctuated<FnArg, Comma>>,
@@ -159,6 +163,27 @@ impl TaskAttrs {
             .next()
     }
 
+    fn acks_on_failure_or_timeout(&self) -> Option<syn::LitBool> {
+        self.attrs
+            .iter()
+            .filter_map(|a| match a {
+                TaskAttr::AcksOnFailureOrTimeout(r) => Some(r.clone()),
+                _ => None,
+            })
+            .next()
+    }
+
+    fn nacks_enabled(&self) -> Option<syn::LitBool> {
+        self.attrs
+            .iter()
+            .filter_map(|a| match a {
+                TaskAttr::NacksEnabled(r) => Some(r.clone()),
+                _ => None,
+            })
+            .next()
+    }
+
+
     fn content_type(&self) -> Option<syn::Ident> {
         self.attrs
             .iter()
@@ -220,6 +245,8 @@ mod kw {
     syn::custom_keyword!(max_retry_delay);
     syn::custom_keyword!(retry_for_unexpected);
     syn::custom_keyword!(acks_late);
+    syn::custom_keyword!(acks_on_failure_or_timeout);
+    syn::custom_keyword!(nacks_enabled);
     syn::custom_keyword!(content_type);
     syn::custom_keyword!(bind);
     syn::custom_keyword!(on_failure);
@@ -269,6 +296,14 @@ impl parse::Parse for TaskAttr {
             input.parse::<kw::acks_late>()?;
             input.parse::<Token![=]>()?;
             Ok(TaskAttr::AcksLate(input.parse()?))
+        } else if lookahead.peek(kw::acks_on_failure_or_timeout) {
+            input.parse::<kw::acks_on_failure_or_timeout>()?;
+            input.parse::<Token![=]>()?;
+            Ok(TaskAttr::AcksOnFailureOrTimeout(input.parse()?))
+        } else if lookahead.peek(kw::nacks_enabled) {
+            input.parse::<kw::nacks_enabled>()?;
+            input.parse::<Token![=]>()?;
+            Ok(TaskAttr::NacksEnabled(input.parse()?))
         } else if lookahead.peek(kw::content_type) {
             input.parse::<kw::content_type>()?;
             input.parse::<Token![=]>()?;
@@ -306,6 +341,8 @@ impl Task {
             max_retry_delay: attrs.max_retry_delay(),
             retry_for_unexpected: attrs.retry_for_unexpected(),
             acks_late: attrs.acks_late(),
+            acks_on_failure_or_timeout: attrs.acks_on_failure_or_timeout(),
+            nacks_enabled: attrs.nacks_enabled(),
             content_type: attrs.content_type(),
             original_args: Vec::new(),
             inputs: None,
@@ -528,6 +565,16 @@ impl ToTokens for Task {
             .as_ref()
             .map(|r| quote! { Some(#r) })
             .unwrap_or_else(|| quote! { None });
+        let acks_on_failure_or_timeout = self
+            .acks_on_failure_or_timeout
+            .as_ref()
+            .map(|r| quote! { Some(#r) })
+            .unwrap_or_else(|| quote! { None });
+        let nacks_enabled = self
+            .nacks_enabled
+            .as_ref()
+            .map(|r| quote! { Some(#r) })
+            .unwrap_or_else(|| quote! { None });
         let content_type = self
             .content_type
             .as_ref()
@@ -665,6 +712,8 @@ impl ToTokens for Task {
                         max_retry_delay: #max_retry_delay,
                         retry_for_unexpected: #retry_for_unexpected,
                         acks_late: #acks_late,
+                        acks_on_failure_or_timeout: #acks_on_failure_or_timeout,
+                        nacks_enabled: #nacks_enabled,
                         content_type: #content_type,
                     };
 
