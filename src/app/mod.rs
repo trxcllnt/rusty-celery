@@ -476,8 +476,13 @@ where
                 // Otherwise we could reach the prefetch_count and end up blocking
                 // other deliveries if there are a high number of messages with a
                 // future ETA.
-                self.retry_delivery_if_needed(tracer.nacks_enabled(), &delivery, None)
-                    .await?;
+                self.retry_delivery_if_needed(
+                    &delivery,
+                    None,
+                    tracer.acks_on_failure_or_timeout(),
+                    tracer.nacks_enabled(),
+                )
+                .await?;
 
                 self.commit_message_reception(
                     false,
@@ -511,8 +516,13 @@ where
         let tracer_result = tracer.trace().await;
         if let Err(TraceError::Retry(retry_eta)) = tracer_result {
             // If retry error -> retry the task.
-            self.retry_delivery_if_needed(tracer.nacks_enabled(), &delivery, retry_eta)
-                .await?;
+            self.retry_delivery_if_needed(
+                &delivery,
+                retry_eta,
+                tracer.acks_on_failure_or_timeout(),
+                tracer.nacks_enabled(),
+            )
+            .await?;
         }
 
         // If we have not done it before, we have to acknowledge the message now.
@@ -561,11 +571,13 @@ where
         nacks_enabled: bool,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         if success || acks_on_failure_or_timeout {
+            println!("Broker ACK!");
             self.broker
                 .ack(delivery)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
         } else if nacks_enabled {
+            println!("Broker NACK!");
             self.broker
                 .nack(delivery)
                 .await
@@ -575,16 +587,23 @@ where
         Ok(())
     }
 
-    /// Retries a delivery only if nacks_enabled is false. This is because when the named flag is
-    /// true, we leverage the retries to the broker
+    /// Retries a delivery only if:
+    /// - nacks_enabled is false: This is because when the named flag is true, we leverage the retries
+    /// to the broker by letting the broker know that we could not process the message correctly through
+    /// a negative awknodledge
+    ///
+    /// - acks_on_failure_or_timeout is true: This is because when the named flag is false, we leverage
+    /// the retries to the broker by never awknowledging/negative awknowledging the processed
+    /// message
     async fn retry_delivery_if_needed(
         // TODO: Name??????????????
         &self,
-        nacks_enabled: bool,
         delivery: &B::Delivery,
         retry_eta: Option<DateTime<Utc>>,
+        acks_on_failure_or_timeout: bool,
+        nacks_enabled: bool,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        if nacks_enabled {
+        if nacks_enabled || !acks_on_failure_or_timeout {
             return Ok(());
         }
 
