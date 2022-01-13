@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use colored::Colorize;
 use futures::stream::StreamExt;
 use log::{debug, error, info, warn};
@@ -475,10 +476,8 @@ where
                 // Otherwise we could reach the prefetch_count and end up blocking
                 // other deliveries if there are a high number of messages with a
                 // future ETA.
-                self.broker
-                    .retry(&delivery, None)
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+                self.retry_delivery_if_needed(tracer.nacks_enabled(), &delivery, None)
+                    .await?;
 
                 self.commit_message_reception(
                     false,
@@ -502,7 +501,7 @@ where
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
 
-            self.broker.on_message_processed(&delivery)?;
+            self.broker.on_message_processed(&delivery).await?;
         }
 
         // Try tracing the task now.
@@ -512,10 +511,8 @@ where
         let tracer_result = tracer.trace().await;
         if let Err(TraceError::Retry(retry_eta)) = tracer_result {
             // If retry error -> retry the task.
-            self.broker
-                .retry(&delivery, retry_eta)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+            self.retry_delivery_if_needed(tracer.nacks_enabled(), &delivery, retry_eta)
+                .await?;
         }
 
         // If we have not done it before, we have to acknowledge the message now.
@@ -529,7 +526,7 @@ where
             .await?;
 
             // Notify to the broker that the task finished
-            self.broker.on_message_processed(&delivery)?;
+            self.broker.on_message_processed(&delivery).await?;
         }
 
         // If we had increased the prefetch count above due to a future ETA, we have
@@ -576,6 +573,25 @@ where
         }
 
         Ok(())
+    }
+
+    /// Retries a delivery only if nacks_enabled is false. This is because when the named flag is
+    /// true, we leverage the retries to the broker
+    async fn retry_delivery_if_needed(
+        // TODO: Name??????????????
+        &self,
+        nacks_enabled: bool,
+        delivery: &B::Delivery,
+        retry_eta: Option<DateTime<Utc>>,
+    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        if nacks_enabled {
+            return Ok(());
+        }
+
+        self.broker
+            .retry(delivery, retry_eta)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
     }
 
     /// Close channels and connections.

@@ -221,7 +221,8 @@ impl Broker for AMQPBroker {
     async fn nack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
         delivery
             .1
-            .reject(BasicRejectOptions::default())
+            //.reject(BasicRejectOptions::default())
+            .reject(BasicRejectOptions { requeue: true })
             .await
             .map_err(|e| e.into())
     }

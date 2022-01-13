@@ -93,7 +93,7 @@ pub trait Broker: Send + Sync + Sized {
     async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError>;
 
     /// Callback used to notify that a certain task's message was processed
-    fn on_message_processed(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
+    async fn on_message_processed(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
         Ok(())
     }
 }
