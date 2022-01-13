@@ -323,7 +323,7 @@ impl Broker for RedisBroker {
     }
 
     async fn nack(&self, _delivery: &Self::Delivery) -> Result<(), BrokerError> {
-        warn!("It does not make sense to negative awknoledge a message. Change the configuration.");
+        warn!("Negative acknowledges not supported.");
         Ok(())
     }
 

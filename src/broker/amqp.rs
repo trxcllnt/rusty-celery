@@ -221,8 +221,7 @@ impl Broker for AMQPBroker {
     async fn nack(&self, delivery: &Self::Delivery) -> Result<(), BrokerError> {
         delivery
             .1
-            //.reject(BasicRejectOptions::default())
-            .reject(BasicRejectOptions { requeue: true })
+            .reject(BasicRejectOptions::default())
             .await
             .map_err(|e| e.into())
     }
@@ -232,7 +231,12 @@ impl Broker for AMQPBroker {
         delivery: &Self::Delivery,
         eta: Option<DateTime<Utc>>,
     ) -> Result<(), BrokerError> {
-        let mut headers = delivery.1.properties.headers().clone().unwrap_or_default();
+        let mut headers = delivery
+            .1
+            .properties
+            .headers()
+            .clone()
+            .unwrap_or_else(FieldTable::default);
 
         // Increment the number of retries.
         let retries = match get_header_u32(&headers, "retries") {

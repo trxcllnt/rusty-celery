@@ -114,8 +114,8 @@ pub struct TaskOptions {
     /// - [`acks_on_failure_or_timeout`](crate::CeleryBuilder::acks_on_failure_or_timeout) at the app level, and
     /// - [`acks_on_failure_or_timeout`](../attr.task.html#parameters) at the task level.
     ///
-    /// If this option is left unspecified, the default behavior will be to acknowledge the message
-    /// even if they fail.
+    /// If this option is left unspecified, the default behavior will be to acknowledge messages
+    /// for this task even if it fails.
     pub acks_on_failure_or_timeout: Option<bool>,
 
     /// When enabled messages for this task will be negatively acknowledged if it
@@ -164,10 +164,11 @@ impl TaskOptions {
     }
 }
 
-/// The objetive of this struct is to centralize the concrete default values that have
-/// the same behaviour as if the configuration was not defined (with None variant of Option<> enum)
+/// This struct aims for centralizing the concrete default values.
 ///
-/// Instread of writing:
+/// These values behave as if the configuration was not defined.
+///
+/// Instead of writing:
 /// ```rust
 /// use celery::task::TaskOptions;
 ///

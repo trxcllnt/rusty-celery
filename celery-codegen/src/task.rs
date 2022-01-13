@@ -183,7 +183,6 @@ impl TaskAttrs {
             .next()
     }
 
-
     fn content_type(&self) -> Option<syn::Ident> {
         self.attrs
             .iter()

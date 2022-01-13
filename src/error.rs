@@ -34,6 +34,9 @@ pub enum CeleryError {
 
     #[error("received unregistered task {0}")]
     UnregisteredTaskError(String),
+
+    #[error("configuration error: {0}")]
+    ConfigurationError(String),
 }
 
 /// Errors that can occur while creating or using a `Beat` app.

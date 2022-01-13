@@ -214,7 +214,7 @@ where
 
     /// Construct a [`Celery`] app with the current configuration.
     pub async fn build(self) -> Result<Celery<Bb::Broker>, CeleryError> {
-        // First we check we have a valid configuration
+        // Check if we have a valid configuration.
         self.check_config()?;
 
         // Declare default queue to broker.
@@ -253,33 +253,47 @@ where
         })
     }
 
+    /// Checks the app-level configuration for tasks.
+    ///
+    /// We return an error when the user sets only some configurations explicitly leaving other
+    /// related configurations to the ones setted explicitly unspecified. The consequence of this
+    /// is having tasks that will not behave as intended.
+    ///
+    /// We print a warning when the user sets related configurations explicitly. In this case,
+    /// the resulting task behaviors may differ from what was intended.
     fn check_config(&self) -> Result<(), CeleryError> {
         let nacks_enabled = self.config.task_options.nacks_enabled;
         let acks_on_failure_or_timeout = self.config.task_options.acks_on_failure_or_timeout;
 
         match (nacks_enabled, acks_on_failure_or_timeout) {
-            // We just warn because this may be an intended configuration. Maybe the user want the
-            // broker to manage never-awknodleged messages
-            (Some(false), Some(false)) =>  warn!(
-                "The configuration \"nacks_enabled = false\" and \"acks_on_failure_or_timeout = false\" will result \
-                in never acknowledging/negative acknowledging FAILED messages."
-            ),
+            (Some(true), None) => {
+                Err(CeleryError::ConfigurationError(String::from(
+                    "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
+                    is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
+                    \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
+                    \"acks_on_failure_or_timeout = false\"."
+                )))
+            }
 
-            (Some(true), Some(true)) => warn!(
-                "The configuration \"nacks_enabled = true\" and \"acks_on_failure_or_timeout = true\" will result \
-                in acknowledging both FAILED and SUCCESSFUL messages. \"acks_on_failure_or_timeout\" has precedence over \
-                \"nacks_enabled\"."
-            ),
+            (Some(false), Some(false)) => {
+                warn!(
+                    "Setting \"nacks_enabled = false\" and \"acks_on_failure_or_timeout = false\" will result \
+                    in never acknowledging/negative acknowledging FAILED messages."
+                );
+                Ok(())
+            }
 
-            (Some(true), None) => warn!(
-                "The configuration \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
-                will result in acknowledging both FAILED and SUCCESSFUL messages. \"acks_on_failure_or_timeout\" default \
-                value is \"true\" and has precedence over \"nacks_enabled\"."
-            ),
-            _ => ()
+            (Some(true), Some(true)) => {
+                warn!(
+                    "Setting \"nacks_enabled = true\" and \"acks_on_failure_or_timeout = true\" will result \
+                    in acknowledging both FAILED and SUCCESSFUL messages. \"acks_on_failure_or_timeout\" has \
+                    precedence over \"nacks_enabled\"."
+                );
+                Ok(())
+            }
+
+            _ => Ok(()),
         }
-
-        Ok(())
     }
 }
 
@@ -298,7 +312,7 @@ pub struct Celery<B: Broker> {
     /// The default queue to send and receive from.
     pub default_queue: String,
 
-    /// App level task options.
+    /// Default task options.
     pub task_options: TaskOptions,
 
     /// A vector of routing rules in the order of their importance.
@@ -426,15 +440,14 @@ where
             Err(e) => {
                 // This is a naughty message that we can't handle, so we'll ack it with
                 // the broker so it gets deleted.
-                self.commit_message_reception(
-                    false,
+                self.notify_message_process_failed(
                     &delivery,
                     self.task_options
                         .acks_on_failure_or_timeout
                         .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
                     self.task_options
-                        .acks_late
-                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_late),
+                        .nacks_enabled
+                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
                 )
                 .await?;
 
@@ -451,15 +464,14 @@ where
                 // Even though the message meta data was okay, we failed to deserialize
                 // the body of the message for some reason, so ack it with the broker
                 // to delete it and return an error.
-                self.commit_message_reception(
-                    false,
+                self.notify_message_process_failed(
                     &delivery,
                     self.task_options
                         .acks_on_failure_or_timeout
                         .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
                     self.task_options
-                        .acks_late
-                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_late),
+                        .nacks_enabled
+                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
                 )
                 .await?;
 
@@ -484,11 +496,14 @@ where
                 )
                 .await?;
 
-                self.commit_message_reception(
-                    false,
+                self.notify_message_process_failed(
                     &delivery,
-                    tracer.acks_on_failure_or_timeout(),
-                    tracer.acks_late(),
+                    self.task_options
+                        .acks_on_failure_or_timeout
+                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
+                    self.task_options
+                        .nacks_enabled
+                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
                 )
                 .await?;
 
@@ -501,11 +516,7 @@ where
 
         // If acks_late is false, we acknowledge the message before tracing it.
         if !tracer.acks_late() {
-            self.broker
-                .ack(&delivery)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
-
+            self.notify_message_processed_succesfuly(&delivery).await?;
             self.broker.on_message_processed(&delivery).await?;
         }
 
@@ -527,15 +538,17 @@ where
 
         // If we have not done it before, we have to acknowledge the message now.
         if tracer.acks_late() {
-            self.commit_message_reception(
-                tracer_result.is_ok(),
-                &delivery,
-                tracer.acks_on_failure_or_timeout(),
-                tracer.nacks_enabled(),
-            )
-            .await?;
-
-            // Notify to the broker that the task finished
+            if tracer_result.is_ok() {
+                self.notify_message_processed_succesfuly(&delivery).await?;
+            } else {
+                self.notify_message_process_failed(
+                    &delivery,
+                    tracer.acks_on_failure_or_timeout(),
+                    tracer.nacks_enabled(),
+                )
+                .await?;
+            }
+            // Notify the broker that the message was processed
             self.broker.on_message_processed(&delivery).await?;
         }
 
@@ -562,22 +575,33 @@ where
         }
     }
 
-    // TODO: Name?????????
-    async fn commit_message_reception(
+    /// Notify the broker that we correctly processed the message.
+    async fn notify_message_processed_succesfuly(
         &self,
-        success: bool,
+        delivery: &B::Delivery,
+    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        self.broker
+            .ack(delivery)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
+    }
+
+    /// Notify the broker that something went wrong processing the message.
+    ///
+    /// Depeding on the configuration we may notify a common acknowledge, a negative acknowledge
+    /// or nothing at all.
+    async fn notify_message_process_failed(
+        &self,
         delivery: &B::Delivery,
         acks_on_failure_or_timeout: bool,
         nacks_enabled: bool,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        if success || acks_on_failure_or_timeout {
-            println!("Broker ACK!");
+        if acks_on_failure_or_timeout {
             self.broker
                 .ack(delivery)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
         } else if nacks_enabled {
-            println!("Broker NACK!");
             self.broker
                 .nack(delivery)
                 .await
@@ -587,16 +611,14 @@ where
         Ok(())
     }
 
-    /// Retries a delivery only if:
-    /// - nacks_enabled is false: This is because when the named flag is true, we leverage the retries
-    /// to the broker by letting the broker know that we could not process the message correctly through
-    /// a negative awknodledge
+    /// Retries a delivery only if "nacks_enabled" is false or "acks_on_failure_or_timeout" is true.
     ///
-    /// - acks_on_failure_or_timeout is true: This is because when the named flag is false, we leverage
-    /// the retries to the broker by never awknowledging/negative awknowledging the processed
-    /// message
+    /// Any other configuration means that we are relying on the native broker's mechanism (such as
+    /// requeueing or dead letter queues).
+    ///
+    /// WARNING: If the user is using a broker incompatible with these configurations (such as Redis)
+    /// this may result in undefined behaviour.
     async fn retry_delivery_if_needed(
-        // TODO: Name??????????????
         &self,
         delivery: &B::Delivery,
         retry_eta: Option<DateTime<Utc>>,
