@@ -1,12 +1,11 @@
 // Adapted from https://github.com/kureuil/batch-rs/blob/master/batch-codegen/src/job.rs.
-
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::Comma;
 use syn::visit_mut::VisitMut;
-use syn::{parse, FnArg, Token};
+use syn::{parse, FnArg, LitBool, Token};
 
 use crate::error::Error;
 
@@ -325,8 +324,32 @@ impl parse::Parse for TaskAttr {
     }
 }
 
+/// Checks task configuration when defining it in a macro.
+///
+/// We PANIC when the user sets only some configurations explicitly leaving other related
+/// configurations to the ones setted explicitly unspecified. The consequence of this
+/// is having tasks that will not behave as intended.
+fn check_config(attrs: &TaskAttrs) {
+    let nacks_enabled = attrs.nacks_enabled();
+    let acks_on_failure_or_timeout = attrs.acks_on_failure_or_timeout();
+
+    if let (Some(LitBool { value: true, .. }), None) = (nacks_enabled, acks_on_failure_or_timeout) {
+        panic!(
+            "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
+            is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
+            \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
+            \"acks_on_failure_or_timeout = false\". \
+            e.g.: #[celery::task(nacks_enabled = true, acks_on_failure_or_timeout = false)]"
+        )
+    }
+}
+
 impl Task {
     fn new(attrs: TaskAttrs) -> Self {
+        // Check configurations are correct
+        check_config(&attrs);
+
+        // Return the task
         Task {
             errors: Vec::new(),
             visibility: syn::Visibility::Inherited,

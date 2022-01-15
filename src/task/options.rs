@@ -122,7 +122,7 @@ pub struct TaskOptions {
     /// fails or times out
     ///
     /// Configuring this setting only applies to tasks that are acknowledged **after** they
-    /// have been executed and only if [`task_acks_late`] is enabled and [`acks_on_failure_or_timeout`]
+    /// have been executed and only if [`task_acks_late`] is enabled and [`task_acks_on_failure_or_timeout`]
     /// is disabled.
     ///
     /// This can be set with
