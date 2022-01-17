@@ -1,5 +1,6 @@
 use super::Celery;
 use crate::broker::mock::MockBroker;
+use crate::prelude::CeleryError;
 use crate::protocol::MessageContentType;
 use crate::task::{Request, Signature, Task, TaskOptions, TaskResult};
 use async_trait::async_trait;
@@ -270,4 +271,18 @@ async fn test_configured_app_send_task_request_overrides() {
     let message = &sent_tasks.get(&result.task_id).unwrap().0;
     assert!(message.headers.timelimit == (Some(10), Some(2)));
     assert!(message.properties.content_type == "application/json");
+}
+
+#[tokio::test]
+async fn test_configure_app_nacks_enabled_only_error() {
+    let celery = Celery::<MockBroker>::builder("mock-app", "mock://localhost:8000")
+        .nacks_enabled(true)
+        .build()
+        .await;
+    match celery {
+        Err(e) => assert!(matches!(e, CeleryError::ConfigurationError(_))),
+        _ => panic!(
+            "Building a broker with only \"nacks_enabled = true\" should have returned an error."
+        ),
+    }
 }
