@@ -516,7 +516,7 @@ where
 
         // If acks_late is false, we acknowledge the message before tracing it.
         if !tracer.acks_late() {
-            self.notify_message_processed_succesfuly(&delivery).await?;
+            self.notify_message_processed_successfully(&delivery).await?;
             self.broker.on_message_processed(&delivery).await?;
         }
 
@@ -539,7 +539,7 @@ where
         // If we have not done it before, we have to acknowledge the message now.
         if tracer.acks_late() {
             if tracer_result.is_ok() {
-                self.notify_message_processed_succesfuly(&delivery).await?;
+                self.notify_message_processed_successfully(&delivery).await?;
             } else {
                 self.notify_message_process_failed(
                     &delivery,
@@ -576,7 +576,7 @@ where
     }
 
     /// Notify the broker that we correctly processed the message.
-    async fn notify_message_processed_succesfuly(
+    async fn notify_message_processed_successfully(
         &self,
         delivery: &B::Delivery,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
