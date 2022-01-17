@@ -108,7 +108,7 @@ pub struct TaskOptions {
     /// fails or times out
     ///
     /// Configuring this setting only applies to tasks that are acknowledged **after** they
-    /// have been executed and only if [`task_acks_late`] is enabled.
+    /// have been executed and only if [`acks_late`](crate::CeleryBuilder::acks_late) is enabled.
     ///
     /// This can be set with
     /// - [`acks_on_failure_or_timeout`](crate::CeleryBuilder::acks_on_failure_or_timeout) at the app level, and
@@ -122,8 +122,8 @@ pub struct TaskOptions {
     /// fails or times out
     ///
     /// Configuring this setting only applies to tasks that are acknowledged **after** they
-    /// have been executed and only if [`task_acks_late`] is enabled and [`task_acks_on_failure_or_timeout`]
-    /// is disabled.
+    /// have been executed and only if [`acks_late`](crate::CeleryBuilder::acks_late) is enabled
+    /// and [`acks_on_failure_or_timeout`](crate::CeleryBuilder::acks_on_failure_or_timeout) is disabled.
     ///
     /// This can be set with
     /// - [`nacks_enabled`](crate::CeleryBuilder::nacks_enabled) at the app level, and
