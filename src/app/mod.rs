@@ -262,38 +262,57 @@ where
     /// We print a warning when the user sets related configurations explicitly. In this case,
     /// the resulting task behaviors may differ from what was intended.
     fn check_config(&self) -> Result<(), CeleryError> {
+        let acks_late = self.config.task_options.acks_late;
         let nacks_enabled = self.config.task_options.nacks_enabled;
         let acks_on_failure_or_timeout = self.config.task_options.acks_on_failure_or_timeout;
 
-        match (nacks_enabled, acks_on_failure_or_timeout) {
-            (Some(true), None) => {
-                Err(CeleryError::ConfigurationError(String::from(
-                    "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
-                    is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
-                    \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
-                    \"acks_on_failure_or_timeout = false\"."
-                )))
+        if let (None, Some(false)) = (acks_late, acks_on_failure_or_timeout) {
+            return Err(CeleryError::ConfigurationError(String::from(
+                "Setting \"acks_on_failure_or_timeout = false\" without specifying \"acks_late\" \
+                is invalid. \"acks_late\" is disabled by default and has precedence over \
+                \"acks_on_failure_or_timeout\". To disable acknowledgements on task failures, you must \
+                explicitly set \"acks_late = true\".",
+            )));
+        }
+
+        if let (None, Some(true)) = (acks_on_failure_or_timeout, nacks_enabled) {
+            return Err(CeleryError::ConfigurationError(String::from(
+                "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
+                is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
+                \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
+                \"acks_on_failure_or_timeout = false\"."
+            )));
+        }
+
+        match (acks_late, acks_on_failure_or_timeout, nacks_enabled) {
+            (Some(false), Some(_), Some(_)) => {
+                warn!(
+                    "Setting \"acks_late = false\", \"acks_on_failure_or_timeout = true | false\" and \
+                    \"nacks_enabled = true | false\" will result in acknowledging all messages. \
+                    \"acks_late\" has precedence over \"nacks_enabled\" and \"acks_on_failure_or_timeout\"."
+                );
             }
 
-            (Some(false), Some(false)) => {
+            (Some(true), Some(false), Some(false)) => {
                 warn!(
                     "Setting \"nacks_enabled = false\" and \"acks_on_failure_or_timeout = false\" will result \
-                    in never acknowledging/negative acknowledging FAILED messages."
+                    in never acknowledging/negative acknowledging FAILED messages. \
+                    You can have the same behavior leaving only \"acks_on_failure_or_timeout = false\"."
                 );
-                Ok(())
             }
 
-            (Some(true), Some(true)) => {
+            (Some(true), Some(true), Some(_)) => {
                 warn!(
-                    "Setting \"nacks_enabled = true\" and \"acks_on_failure_or_timeout = true\" will result \
+                    "Setting \"nacks_enabled = true | false\" and \"acks_on_failure_or_timeout = true\" will result \
                     in acknowledging both FAILED and SUCCESSFUL messages. \"acks_on_failure_or_timeout\" has \
                     precedence over \"nacks_enabled\"."
                 );
-                Ok(())
             }
 
-            _ => Ok(()),
+            _ => (),
         }
+
+        Ok(())
     }
 }
 
@@ -516,7 +535,8 @@ where
 
         // If acks_late is false, we acknowledge the message before tracing it.
         if !tracer.acks_late() {
-            self.notify_message_processed_successfully(&delivery).await?;
+            self.notify_message_processed_successfully(&delivery)
+                .await?;
             self.broker.on_message_processed(&delivery).await?;
         }
 
@@ -539,7 +559,8 @@ where
         // If we have not done it before, we have to acknowledge the message now.
         if tracer.acks_late() {
             if tracer_result.is_ok() {
-                self.notify_message_processed_successfully(&delivery).await?;
+                self.notify_message_processed_successfully(&delivery)
+                    .await?;
             } else {
                 self.notify_message_process_failed(
                     &delivery,
@@ -617,7 +638,7 @@ where
     /// requeueing or dead letter queues).
     ///
     /// WARNING: If the user is using a broker incompatible with these configurations (such as Redis)
-    /// this may result in undefined behaviour.
+    /// this may result in undefined behavior.
     async fn retry_delivery_if_needed(
         &self,
         delivery: &B::Delivery,

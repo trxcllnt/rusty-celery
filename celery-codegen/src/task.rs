@@ -330,16 +330,28 @@ impl parse::Parse for TaskAttr {
 /// configurations to the ones setted explicitly unspecified. The consequence of this
 /// is having tasks that will not behave as intended.
 fn check_config(attrs: &TaskAttrs) {
+    let acks_late = attrs.acks_late();
     let nacks_enabled = attrs.nacks_enabled();
     let acks_on_failure_or_timeout = attrs.acks_on_failure_or_timeout();
 
-    if let (Some(LitBool { value: true, .. }), None) = (nacks_enabled, acks_on_failure_or_timeout) {
+    if let (None, Some(LitBool { value: false, .. })) = (&acks_late, &acks_on_failure_or_timeout) {
+        panic!(
+            "Setting \"acks_on_failure_or_timeout = false\" without specifying \"acks_late\" \
+            is invalid. \"acks_late\" is disabled by default and has precedence over \
+            \"acks_on_failure_or_timeout\". To disable acknowledgements on task failures, you must \
+            explicitly set \"acks_late = true\". \
+            e.g.: #[celery::task(acks_late = true, acks_on_failure_or_timeout = false)]"
+        )
+    }
+
+    if let (None, Some(LitBool { value: true, .. })) = (&acks_on_failure_or_timeout, &nacks_enabled)
+    {
         panic!(
             "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
             is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
             \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
             \"acks_on_failure_or_timeout = false\". \
-            e.g.: #[celery::task(nacks_enabled = true, acks_on_failure_or_timeout = false)]"
+            e.g.: #[celery::task(acks_late = true, nacks_enabled = true, acks_on_failure_or_timeout = false)]"
         )
     }
 }
