@@ -1,7 +1,7 @@
 //! Defines the Celery protocol.
 //!
 //! The top part of the protocol is the [`Message`] struct, which builds on
-//! top of the protocol for a broker. This is why a broker's [`Delivery`](crate::broker::Broker::Delivery)
+//! top of the protocol for a broker. This is why a broker's [`Delivery`](crate::broker::Delivery)
 //! type must implement [`TryCreateMessage`].
 
 use base64::{
@@ -569,7 +569,7 @@ where
 }
 
 /// A trait for attempting to deserialize a [`Message`] from `self`. This is required to be implemented
-/// on a broker's [`Delivery`](crate::broker::Broker::Delivery) type.
+/// on a broker's [`Delivery`](crate::broker::Delivery) type.
 pub trait TryDeserializeMessage {
     fn try_deserialize_message(&self) -> Result<Message, ProtocolError>;
 }
