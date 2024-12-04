@@ -203,7 +203,7 @@ impl Channel {
         redis::cmd("HDEL")
             .arg(&self.process_map_name())
             .arg(&delivery.properties.correlation_id)
-            .query_async(&mut self.connection.clone())
+            .query_async::<ConnectionManager, ()>(&mut self.connection.clone())
             .await?;
         Ok(())
     }
@@ -240,6 +240,10 @@ impl super::Delivery for (Channel, Delivery) {
     }
 
     async fn ack(&self) -> Result<(), BrokerError> {
+        todo!()
+    }
+
+    async fn nack(&self) -> Result<(), BrokerError> {
         todo!()
     }
 }
@@ -343,6 +347,11 @@ impl Broker for RedisBroker {
         Ok(())
     }
 
+    async fn nack(&self, _delivery: &dyn super::Delivery) -> Result<(), BrokerError> {
+        warn!("Negative acknowledges not supported.");
+        Ok(())
+    }
+
     /// Retry a delivery.
     async fn retry(
         &self,
@@ -383,7 +392,9 @@ impl Broker for RedisBroker {
     /// Clone all channels and connection.
     async fn close(&self) -> Result<(), BrokerError> {
         let mut conn = self.manager.clone();
-        redis::cmd("QUIT").query_async(&mut conn).await?;
+        redis::cmd("QUIT")
+            .query_async::<ConnectionManager, ()>(&mut conn)
+            .await?;
         Ok(())
     }
 

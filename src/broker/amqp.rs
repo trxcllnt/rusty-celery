@@ -5,8 +5,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures::Stream;
 use lapin::message::Delivery;
 use lapin::options::{
-    BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
-    QueueDeclareOptions,
+    BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicNackOptions,
+    BasicPublishOptions, BasicQosOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldArray, FieldTable};
 use lapin::uri::{self, AMQPUri};
@@ -49,6 +49,10 @@ impl super::Delivery for Delivery {
     }
     async fn ack(&self) -> Result<(), BrokerError> {
         lapin::acker::Acker::ack(self, BasicAckOptions::default()).await?;
+        Ok(())
+    }
+    async fn nack(&self) -> Result<(), BrokerError> {
+        lapin::acker::Acker::nack(self, BasicNackOptions::default()).await?;
         Ok(())
     }
 }
@@ -277,6 +281,10 @@ impl Broker for AMQPBroker {
 
     async fn ack(&self, delivery: &dyn super::Delivery) -> Result<(), BrokerError> {
         delivery.ack().await
+    }
+
+    async fn nack(&self, delivery: &dyn super::Delivery) -> Result<(), BrokerError> {
+        delivery.nack().await
     }
 
     async fn retry(

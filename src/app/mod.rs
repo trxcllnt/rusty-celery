@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use colored::Colorize;
 use futures::stream::StreamExt;
 use log::{debug, error, info, warn};
@@ -24,7 +25,9 @@ use crate::broker::{
 use crate::error::{BrokerError, CeleryError, TraceError};
 use crate::protocol::{Message, MessageContentType};
 use crate::routing::Rule;
-use crate::task::{AsyncResult, Signature, Task, TaskEvent, TaskOptions, TaskStatus};
+use crate::task::{
+    AsyncResult, Signature, Task, TaskEvent, TaskOptions, TaskOptionsConcreteDefault, TaskStatus,
+};
 use trace::{build_tracer, TraceBuilder, TracerTrait};
 
 struct Config {
@@ -152,6 +155,20 @@ impl CeleryBuilder {
         self
     }
 
+    /// Set whether by default a task is acknowledged even if it fails or timeouts (see
+    /// [`TaskOptions::acks_on_failure_or_timeout`]).
+    pub fn acks_on_failure_or_timeout(mut self, acks_on_failure_or_timeout: bool) -> Self {
+        self.config.task_options.acks_on_failure_or_timeout = Some(acks_on_failure_or_timeout);
+        self
+    }
+
+    /// Set whether by default a task is negative acknowledged if it fails or timeouts (see
+    /// [`TaskOptions::nacks_enabled`]).
+    pub fn nacks_enabled(mut self, nacks_enabled: bool) -> Self {
+        self.config.task_options.nacks_enabled = Some(nacks_enabled);
+        self
+    }
+
     /// Set default serialization format a task will have (see [`TaskOptions::content_type`]).
     pub fn task_content_type(mut self, content_type: MessageContentType) -> Self {
         self.config.task_options.content_type = Some(content_type);
@@ -191,6 +208,9 @@ impl CeleryBuilder {
 
     /// Construct a [`Celery`] app with the current configuration.
     pub async fn build(self) -> Result<Celery, CeleryError> {
+        // Check if we have a valid configuration.
+        self.check_config()?;
+
         // Declare default queue to broker.
         let broker_builder = self
             .config
@@ -225,6 +245,68 @@ impl CeleryBuilder {
             broker_connection_max_retries: self.config.broker_connection_max_retries,
             broker_connection_retry_delay: self.config.broker_connection_retry_delay,
         })
+    }
+
+    /// Checks the app-level configuration for tasks.
+    ///
+    /// We return an error when the user sets only some configurations explicitly leaving other
+    /// related configurations to the ones setted explicitly unspecified. The consequence of this
+    /// is having tasks that will not behave as intended.
+    ///
+    /// We print a warning when the user sets related configurations explicitly. In this case,
+    /// the resulting task behaviors may differ from what was intended.
+    fn check_config(&self) -> Result<(), CeleryError> {
+        let acks_late = self.config.task_options.acks_late;
+        let nacks_enabled = self.config.task_options.nacks_enabled;
+        let acks_on_failure_or_timeout = self.config.task_options.acks_on_failure_or_timeout;
+
+        if let (None, Some(false)) = (acks_late, acks_on_failure_or_timeout) {
+            return Err(CeleryError::ConfigurationError(String::from(
+                "Setting \"acks_on_failure_or_timeout = false\" without specifying \"acks_late\" \
+                is invalid. \"acks_late\" is disabled by default and has precedence over \
+                \"acks_on_failure_or_timeout\". To disable acknowledgements on task failures, you must \
+                explicitly set \"acks_late = true\".",
+            )));
+        }
+
+        if let (None, Some(true)) = (acks_on_failure_or_timeout, nacks_enabled) {
+            return Err(CeleryError::ConfigurationError(String::from(
+                "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
+                is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
+                \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
+                \"acks_on_failure_or_timeout = false\"."
+            )));
+        }
+
+        match (acks_late, acks_on_failure_or_timeout, nacks_enabled) {
+            (Some(false), Some(_), Some(_)) => {
+                warn!(
+                    "Setting \"acks_late = false\", \"acks_on_failure_or_timeout = true | false\" and \
+                    \"nacks_enabled = true | false\" will result in acknowledging all messages. \
+                    \"acks_late\" has precedence over \"nacks_enabled\" and \"acks_on_failure_or_timeout\"."
+                );
+            }
+
+            (Some(true), Some(false), Some(false)) => {
+                warn!(
+                    "Setting \"nacks_enabled = false\" and \"acks_on_failure_or_timeout = false\" will result \
+                    in never acknowledging/negative acknowledging FAILED messages. \
+                    You can have the same behavior leaving only \"acks_on_failure_or_timeout = false\"."
+                );
+            }
+
+            (Some(true), Some(true), Some(_)) => {
+                warn!(
+                    "Setting \"nacks_enabled = true | false\" and \"acks_on_failure_or_timeout = true\" will result \
+                    in acknowledging both FAILED and SUCCESSFUL messages. \"acks_on_failure_or_timeout\" has \
+                    precedence over \"nacks_enabled\"."
+                );
+            }
+
+            _ => (),
+        }
+
+        Ok(())
     }
 }
 
@@ -367,10 +449,17 @@ impl Celery {
             Err(e) => {
                 // This is a naughty message that we can't handle, so we'll ack it with
                 // the broker so it gets deleted.
-                self.broker
-                    .ack(delivery.as_ref())
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+                self.notify_message_process_failed(
+                    delivery.as_ref(),
+                    self.task_options
+                        .acks_on_failure_or_timeout
+                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
+                    self.task_options
+                        .nacks_enabled
+                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
+                )
+                .await?;
+
                 return Err(Box::new(e));
             }
         };
@@ -384,10 +473,17 @@ impl Celery {
                 // Even though the message meta data was okay, we failed to deserialize
                 // the body of the message for some reason, so ack it with the broker
                 // to delete it and return an error.
-                self.broker
-                    .ack(delivery.as_ref())
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+                self.notify_message_process_failed(
+                    delivery.as_ref(),
+                    self.task_options
+                        .acks_on_failure_or_timeout
+                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
+                    self.task_options
+                        .nacks_enabled
+                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
+                )
+                .await?;
+
                 return Err(e);
             }
         };
@@ -401,14 +497,25 @@ impl Celery {
                 // Otherwise we could reach the prefetch_count and end up blocking
                 // other deliveries if there are a high number of messages with a
                 // future ETA.
-                self.broker
-                    .retry(delivery.as_ref(), None)
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
-                self.broker
-                    .ack(delivery.as_ref())
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+                self.retry_delivery_if_needed(
+                    delivery.as_ref(),
+                    None,
+                    tracer.acks_on_failure_or_timeout(),
+                    tracer.nacks_enabled(),
+                )
+                .await?;
+
+                self.notify_message_process_failed(
+                    delivery.as_ref(),
+                    self.task_options
+                        .acks_on_failure_or_timeout
+                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
+                    self.task_options
+                        .nacks_enabled
+                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
+                )
+                .await?;
+
                 return Err(Box::new(e));
             };
 
@@ -418,30 +525,42 @@ impl Celery {
 
         // If acks_late is false, we acknowledge the message before tracing it.
         if !tracer.acks_late() {
-            self.broker
-                .ack(delivery.as_ref())
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+            self.notify_message_processed_successfully(delivery.as_ref())
+                .await?;
+            self.broker.on_message_processed(delivery.as_ref()).await?;
         }
 
         // Try tracing the task now.
         // NOTE: we don't need to log errors from the trace here since the tracer
         // handles all errors at it's own level or the task level. In this function
         // we only log errors at the broker and delivery level.
-        if let Err(TraceError::Retry(retry_eta)) = tracer.trace().await {
+        let tracer_result = tracer.trace().await;
+        if let Err(TraceError::Retry(retry_eta)) = tracer_result {
             // If retry error -> retry the task.
-            self.broker
-                .retry(delivery.as_ref(), retry_eta)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+            self.retry_delivery_if_needed(
+                delivery.as_ref(),
+                retry_eta,
+                tracer.acks_on_failure_or_timeout(),
+                tracer.nacks_enabled(),
+            )
+            .await?;
         }
 
         // If we have not done it before, we have to acknowledge the message now.
         if tracer.acks_late() {
-            self.broker
-                .ack(delivery.as_ref())
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+            if tracer_result.is_ok() {
+                self.notify_message_processed_successfully(delivery.as_ref())
+                    .await?;
+            } else {
+                self.notify_message_process_failed(
+                    delivery.as_ref(),
+                    tracer.acks_on_failure_or_timeout(),
+                    tracer.nacks_enabled(),
+                )
+                .await?;
+            }
+            // Notify the broker that the message was processed
+            self.broker.on_message_processed(delivery.as_ref()).await?;
         }
 
         // If we had increased the prefetch count above due to a future ETA, we have
@@ -465,6 +584,66 @@ impl Celery {
         if let Err(e) = self.try_handle_delivery(delivery, event_tx).await {
             error!("{}", e);
         }
+    }
+
+    /// Notify the broker that we correctly processed the message.
+    async fn notify_message_processed_successfully(
+        &self,
+        delivery: &dyn Delivery,
+    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        self.broker
+            .ack(delivery)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
+    }
+
+    /// Notify the broker that something went wrong processing the message.
+    ///
+    /// Depeding on the configuration we may notify a common acknowledge, a negative acknowledge
+    /// or nothing at all.
+    async fn notify_message_process_failed(
+        &self,
+        delivery: &dyn Delivery,
+        acks_on_failure_or_timeout: bool,
+        nacks_enabled: bool,
+    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        if acks_on_failure_or_timeout {
+            self.broker
+                .ack(delivery)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+        } else if nacks_enabled {
+            self.broker
+                .nack(delivery)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+        }
+
+        Ok(())
+    }
+
+    /// Retries a delivery only if "nacks_enabled" is false or "acks_on_failure_or_timeout" is true.
+    ///
+    /// Any other configuration means that we are relying on the native broker's mechanism (such as
+    /// requeueing or dead letter queues).
+    ///
+    /// WARNING: If the user is using a broker incompatible with these configurations (such as Redis)
+    /// this may result in undefined behavior.
+    async fn retry_delivery_if_needed(
+        &self,
+        delivery: &dyn Delivery,
+        retry_eta: Option<DateTime<Utc>>,
+        acks_on_failure_or_timeout: bool,
+        nacks_enabled: bool,
+    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        if nacks_enabled || !acks_on_failure_or_timeout {
+            return Ok(());
+        }
+
+        self.broker
+            .retry(delivery, retry_eta)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
     }
 
     /// Close channels and connections.

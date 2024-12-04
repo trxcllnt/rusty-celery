@@ -1,12 +1,11 @@
 // Adapted from https://github.com/kureuil/batch-rs/blob/master/batch-codegen/src/job.rs.
-
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::Comma;
 use syn::visit_mut::VisitMut;
-use syn::{parse, FnArg, Token};
+use syn::{parse, FnArg, LitBool, Token};
 
 use crate::error::Error;
 
@@ -30,6 +29,8 @@ enum TaskAttr {
     ContentType(syn::Ident),
     RetryForUnexpected(syn::LitBool),
     AcksLate(syn::LitBool),
+    AcksOnFailureOrTimeout(syn::LitBool),
+    NacksEnabled(syn::LitBool),
     Bind(syn::LitBool),
     OnFailure(syn::Ident),
     OnSuccess(syn::Ident),
@@ -51,6 +52,8 @@ struct Task {
     max_retry_delay: Option<syn::LitInt>,
     retry_for_unexpected: Option<syn::LitBool>,
     acks_late: Option<syn::LitBool>,
+    acks_on_failure_or_timeout: Option<syn::LitBool>,
+    nacks_enabled: Option<syn::LitBool>,
     content_type: Option<syn::Ident>,
     original_args: Vec<syn::FnArg>,
     inputs: Option<Punctuated<FnArg, Comma>>,
@@ -183,6 +186,26 @@ impl TaskAttrs {
             .next()
     }
 
+    fn acks_on_failure_or_timeout(&self) -> Option<syn::LitBool> {
+        self.attrs
+            .iter()
+            .filter_map(|a| match a {
+                TaskAttr::AcksOnFailureOrTimeout(r) => Some(r.clone()),
+                _ => None,
+            })
+            .next()
+    }
+
+    fn nacks_enabled(&self) -> Option<syn::LitBool> {
+        self.attrs
+            .iter()
+            .filter_map(|a| match a {
+                TaskAttr::NacksEnabled(r) => Some(r.clone()),
+                _ => None,
+            })
+            .next()
+    }
+
     fn content_type(&self) -> Option<syn::Ident> {
         self.attrs
             .iter()
@@ -245,6 +268,8 @@ mod kw {
     syn::custom_keyword!(max_retry_delay);
     syn::custom_keyword!(retry_for_unexpected);
     syn::custom_keyword!(acks_late);
+    syn::custom_keyword!(acks_on_failure_or_timeout);
+    syn::custom_keyword!(nacks_enabled);
     syn::custom_keyword!(content_type);
     syn::custom_keyword!(bind);
     syn::custom_keyword!(on_failure);
@@ -302,6 +327,14 @@ impl parse::Parse for TaskAttr {
             input.parse::<kw::acks_late>()?;
             input.parse::<Token![=]>()?;
             Ok(TaskAttr::AcksLate(input.parse()?))
+        } else if lookahead.peek(kw::acks_on_failure_or_timeout) {
+            input.parse::<kw::acks_on_failure_or_timeout>()?;
+            input.parse::<Token![=]>()?;
+            Ok(TaskAttr::AcksOnFailureOrTimeout(input.parse()?))
+        } else if lookahead.peek(kw::nacks_enabled) {
+            input.parse::<kw::nacks_enabled>()?;
+            input.parse::<Token![=]>()?;
+            Ok(TaskAttr::NacksEnabled(input.parse()?))
         } else if lookahead.peek(kw::content_type) {
             input.parse::<kw::content_type>()?;
             input.parse::<Token![=]>()?;
@@ -324,8 +357,44 @@ impl parse::Parse for TaskAttr {
     }
 }
 
+/// Checks task configuration when defining it in a macro.
+///
+/// We PANIC when the user sets only some configurations explicitly leaving other related
+/// configurations to the ones setted explicitly unspecified. The consequence of this
+/// is having tasks that will not behave as intended.
+fn check_config(attrs: &TaskAttrs) {
+    let acks_late = attrs.acks_late();
+    let nacks_enabled = attrs.nacks_enabled();
+    let acks_on_failure_or_timeout = attrs.acks_on_failure_or_timeout();
+
+    if let (None, Some(LitBool { value: false, .. })) = (&acks_late, &acks_on_failure_or_timeout) {
+        panic!(
+            "Setting \"acks_on_failure_or_timeout = false\" without specifying \"acks_late\" \
+            is invalid. \"acks_late\" is disabled by default and has precedence over \
+            \"acks_on_failure_or_timeout\". To disable acknowledgements on task failures, you must \
+            explicitly set \"acks_late = true\". \
+            e.g.: #[celery::task(acks_late = true, acks_on_failure_or_timeout = false)]"
+        )
+    }
+
+    if let (None, Some(LitBool { value: true, .. })) = (&acks_on_failure_or_timeout, &nacks_enabled)
+    {
+        panic!(
+            "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
+            is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
+            \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
+            \"acks_on_failure_or_timeout = false\". \
+            e.g.: #[celery::task(acks_late = true, nacks_enabled = true, acks_on_failure_or_timeout = false)]"
+        )
+    }
+}
+
 impl Task {
     fn new(attrs: TaskAttrs) -> Self {
+        // Check configurations are correct
+        check_config(&attrs);
+
+        // Return the task
         Task {
             errors: Vec::new(),
             visibility: syn::Visibility::Inherited,
@@ -341,6 +410,8 @@ impl Task {
             max_retry_delay: attrs.max_retry_delay(),
             retry_for_unexpected: attrs.retry_for_unexpected(),
             acks_late: attrs.acks_late(),
+            acks_on_failure_or_timeout: attrs.acks_on_failure_or_timeout(),
+            nacks_enabled: attrs.nacks_enabled(),
             content_type: attrs.content_type(),
             original_args: Vec::new(),
             inputs: None,
@@ -573,6 +644,16 @@ impl ToTokens for Task {
             .as_ref()
             .map(|r| quote! { Some(#r) })
             .unwrap_or_else(|| quote! { None });
+        let acks_on_failure_or_timeout = self
+            .acks_on_failure_or_timeout
+            .as_ref()
+            .map(|r| quote! { Some(#r) })
+            .unwrap_or_else(|| quote! { None });
+        let nacks_enabled = self
+            .nacks_enabled
+            .as_ref()
+            .map(|r| quote! { Some(#r) })
+            .unwrap_or_else(|| quote! { None });
         let content_type = self
             .content_type
             .as_ref()
@@ -711,6 +792,8 @@ impl ToTokens for Task {
                         max_retry_delay: #max_retry_delay,
                         retry_for_unexpected: #retry_for_unexpected,
                         acks_late: #acks_late,
+                        acks_on_failure_or_timeout: #acks_on_failure_or_timeout,
+                        nacks_enabled: #nacks_enabled,
                         content_type: #content_type,
                     };
 

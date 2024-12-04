@@ -202,6 +202,14 @@ where
     fn acks_late(&self) -> bool {
         self.task.acks_late()
     }
+
+    fn acks_on_failure_or_timeout(&self) -> bool {
+        self.task.acks_on_failure_or_timeout()
+    }
+
+    fn nacks_enabled(&self) -> bool {
+        self.task.nacks_enabled()
+    }
 }
 
 #[async_trait]
@@ -218,6 +226,10 @@ pub(super) trait TracerTrait: Send + Sync {
     fn is_expired(&self) -> bool;
 
     fn acks_late(&self) -> bool;
+
+    fn acks_on_failure_or_timeout(&self) -> bool;
+
+    fn nacks_enabled(&self) -> bool;
 }
 
 pub(super) type TraceBuilderResult = Result<Box<dyn TracerTrait>, ProtocolError>;

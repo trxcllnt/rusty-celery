@@ -33,6 +33,7 @@ pub trait Delivery: TryDeserializeMessage + Send + Sync + std::fmt::Debug {
     ) -> Result<(), BrokerError>;
     async fn remove(&self) -> Result<(), BrokerError>;
     async fn ack(&self) -> Result<(), BrokerError>;
+    async fn nack(&self) -> Result<(), BrokerError>;
 }
 
 /// The error type of an unsuccessful delivery.
@@ -71,6 +72,9 @@ pub trait Broker: Send + Sync {
     /// Acknowledge a [`Delivery`](trait.Broker.html#associatedtype.Delivery) for deletion.
     async fn ack(&self, delivery: &dyn Delivery) -> Result<(), BrokerError>;
 
+    /// Negative acknowledge a [`Delivery`](trait.Broker.html#associatedtype.Delivery).
+    async fn nack(&self, delivery: &dyn Delivery) -> Result<(), BrokerError>;
+
     /// Retry a delivery.
     async fn retry(
         &self,
@@ -94,6 +98,11 @@ pub trait Broker: Send + Sync {
 
     /// Try reconnecting in the event of some sort of connection error.
     async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError>;
+
+    /// Indicates that a message has been processed.
+    async fn on_message_processed(&self, _delivery: &dyn Delivery) -> Result<(), BrokerError> {
+        Ok(())
+    }
 
     #[cfg(test)]
     fn into_any(self: Box<Self>) -> Box<dyn Any>;

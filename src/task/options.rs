@@ -110,6 +110,34 @@ pub struct TaskOptions {
     /// If this option is left unspecified, the default behavior will be to ack early.
     pub acks_late: Option<bool>,
 
+    /// When enabled messages for this task will be acknowledged even if it
+    /// fails or times out
+    ///
+    /// Configuring this setting only applies to tasks that are acknowledged **after** they
+    /// have been executed and only if [`acks_late`](../attr.task.html#parameters) is enabled.
+    ///
+    /// This can be set with
+    /// - [`acks_on_failure_or_timeout`](crate::CeleryBuilder::acks_on_failure_or_timeout) at the app level, and
+    /// - [`acks_on_failure_or_timeout`](../attr.task.html#parameters) at the task level.
+    ///
+    /// If this option is left unspecified, the default behavior will be to acknowledge messages
+    /// for this task even if it fails.
+    pub acks_on_failure_or_timeout: Option<bool>,
+
+    /// When enabled messages for this task will be negatively acknowledged if it
+    /// fails or times out
+    ///
+    /// Configuring this setting only applies to tasks that are acknowledged **after** they
+    /// have been executed and only if [`acks_late`](../attr.task.html#parameters) is enabled
+    /// and [`acks_on_failure_or_timeout`](../attr.task.html#parameters) is disabled.
+    ///
+    /// This can be set with
+    /// - [`nacks_enabled`](crate::CeleryBuilder::nacks_enabled) at the app level, and
+    /// - [`nacks_enabled`](../attr.task.html#parameters) at the task level.
+    ///
+    /// If this option is left unspecified, the default behavior will be to omit the negative acknowledge
+    pub nacks_enabled: Option<bool>,
+
     /// Which serialization format to use for task messages.
     ///
     /// This can be set with
@@ -129,12 +157,68 @@ impl TaskOptions {
         self.max_retry_delay = self.max_retry_delay.or(other.max_retry_delay);
         self.retry_for_unexpected = self.retry_for_unexpected.or(other.retry_for_unexpected);
         self.acks_late = self.acks_late.or(other.acks_late);
+        self.acks_on_failure_or_timeout = self
+            .acks_on_failure_or_timeout
+            .or(other.acks_on_failure_or_timeout);
+        self.nacks_enabled = self.nacks_enabled.or(other.nacks_enabled);
         self.content_type = self.content_type.or(other.content_type);
     }
 
     /// Override the fields in `other` with the fields in `self`.
     pub(crate) fn override_other(&self, other: &mut TaskOptions) {
         other.update(self);
+    }
+}
+
+/// This struct aims for centralizing the concrete default values.
+///
+/// These values behave as if the configuration was not defined.
+///
+/// Instead of writing:
+/// ```rust
+/// use celery::task::TaskOptions;
+///
+/// let config = TaskOptions::default();
+/// config
+///     .acks_late
+///     .unwrap_or(false);
+/// ```
+///
+/// We write
+///
+/// ```rust
+/// use celery::task::{TaskOptions, TaskOptionsConcreteDefault};
+///
+/// let config = TaskOptions::default();
+/// config
+///     .acks_late
+///     .unwrap_or_else(TaskOptionsConcreteDefault::acks_late);
+/// ```
+pub struct TaskOptionsConcreteDefault;
+
+impl TaskOptionsConcreteDefault {
+    pub fn retry_for_unexpected() -> bool {
+        true
+    }
+
+    pub fn min_retry_delay() -> u32 {
+        0
+    }
+
+    pub fn max_retry_delay() -> u32 {
+        3600
+    }
+
+    pub fn acks_late() -> bool {
+        false
+    }
+
+    pub fn acks_on_failure_or_timeout() -> bool {
+        true
+    }
+
+    pub fn nacks_enabled() -> bool {
+        false
     }
 }
 
@@ -147,12 +231,16 @@ mod tests {
         let mut options = TaskOptions {
             max_retries: Some(3),
             acks_late: Some(true),
+            acks_on_failure_or_timeout: Some(true),
+            nacks_enabled: Some(true),
             ..Default::default()
         };
 
         let other = TaskOptions {
             time_limit: Some(2),
             acks_late: Some(false),
+            acks_on_failure_or_timeout: Some(false),
+            nacks_enabled: Some(false),
             ..Default::default()
         };
 
@@ -160,5 +248,7 @@ mod tests {
         assert_eq!(options.time_limit, Some(2));
         assert_eq!(options.max_retries, Some(3));
         assert_eq!(options.acks_late, Some(true));
+        assert_eq!(options.acks_on_failure_or_timeout, Some(true));
+        assert_eq!(options.nacks_enabled, Some(true));
     }
 }
