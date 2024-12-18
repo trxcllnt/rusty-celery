@@ -333,7 +333,7 @@ pub struct Celery {
 
     /// Mapping of task name to task tracer factory. Used to create a task tracer
     /// from an incoming message.
-    task_trace_builders: RwLock<HashMap<String, TraceBuilder>>,
+    task_trace_builders: RwLock<HashMap<String, Arc<TraceBuilder>>>,
 
     broker_connection_timeout: u32,
     broker_connection_retry: bool,
@@ -381,7 +381,7 @@ impl Celery {
 
     /// Send a task to a remote worker. Returns an [`AsyncResult`] with the task ID of the task
     /// if it was successfully sent.
-    pub async fn send_task<T: Task>(
+    pub async fn send_task<T: Task + 'static>(
         &self,
         mut task_sig: Signature<T>,
     ) -> Result<AsyncResult, CeleryError> {
@@ -390,7 +390,12 @@ impl Celery {
         let queue = maybe_queue.as_deref().unwrap_or_else(|| {
             crate::routing::route(T::NAME, &self.task_routes).unwrap_or(&self.default_queue)
         });
-        let message = Message::try_from(task_sig)?;
+
+        let message = tokio::runtime::Handle::current()
+            .spawn_blocking(move || Message::try_from(task_sig))
+            .await
+            .map_err(|e| CeleryError::IoError(e.into()))??;
+
         info!(
             "Sending task {}[{}] to {}",
             T::NAME,
@@ -407,7 +412,7 @@ impl Celery {
         if task_trace_builders.contains_key(T::NAME) {
             Err(CeleryError::TaskRegistrationError(T::NAME.into()))
         } else {
-            task_trace_builders.insert(T::NAME.into(), Box::new(build_tracer::<T>));
+            task_trace_builders.insert(T::NAME.into(), Arc::new(Box::new(build_tracer::<T>)));
             debug!("Registered task {}", T::NAME);
             Ok(())
         }
@@ -420,14 +425,14 @@ impl Celery {
     ) -> Result<Box<dyn TracerTrait>, Box<dyn Error + Send + Sync + 'static>> {
         let task_trace_builders = self.task_trace_builders.read().await;
         if let Some(build_tracer) = task_trace_builders.get(&message.headers.task) {
-            Ok(build_tracer(
-                self.clone(),
-                message,
-                self.task_options,
-                event_tx,
-                self.hostname.clone(),
-            )
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?)
+            let self_ = self.clone();
+            let opts_ = self.task_options;
+            let host_ = self.hostname.clone();
+            let build_tracer_ = build_tracer.clone();
+            Ok(tokio::runtime::Handle::current()
+                .spawn_blocking(move || build_tracer_(self_, message, opts_, event_tx, host_))
+                .await?
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?)
         } else {
             Err(
                 Box::new(CeleryError::UnregisteredTaskError(message.headers.task))
