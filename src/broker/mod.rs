@@ -132,7 +132,11 @@ pub trait BrokerBuilder: Send + Sync {
 pub(crate) fn broker_builder_from_url(broker_url: &str) -> Box<dyn BrokerBuilder> {
     match broker_url.split_once("://") {
         Some(("amqp", _)) => Box::new(AMQPBrokerBuilder::new(broker_url)),
+        Some(("amqps", _)) => Box::new(AMQPBrokerBuilder::new(broker_url)),
         Some(("redis", _)) => Box::new(RedisBrokerBuilder::new(broker_url)),
+        Some(("rediss", _)) => Box::new(RedisBrokerBuilder::new(broker_url)),
+        Some(("redis+unix", _)) => Box::new(RedisBrokerBuilder::new(broker_url)),
+        Some(("unix", _)) => Box::new(RedisBrokerBuilder::new(broker_url)),
         #[cfg(test)]
         Some(("mock", _)) => Box::new(mock::MockBrokerBuilder::new(broker_url)),
         _ => panic!("Unsupported broker"),
