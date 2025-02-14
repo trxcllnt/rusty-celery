@@ -64,6 +64,12 @@ impl BrokerBuilder for RedisBrokerBuilder {
         self
     }
 
+    /// Declare an exclusive queue.
+    fn declare_exclusive_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder> {
+        warn!("declare_exclusive_queue on redis broker is identical to declare_queue");
+        self.declare_queue(name)
+    }
+
     /// Set the heartbeat.
     fn heartbeat(mut self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder> {
         if heartbeat.is_some() {
