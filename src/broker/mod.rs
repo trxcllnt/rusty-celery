@@ -113,6 +113,9 @@ pub trait BrokerBuilder: Send + Sync {
     /// Declare a queue.
     fn declare_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder>;
 
+    /// Declare a exclusive queue.
+    fn declare_exclusive_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder>;
+
     /// Set the heartbeat.
     fn heartbeat(self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder>;
 

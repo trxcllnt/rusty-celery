@@ -165,6 +165,27 @@ impl BrokerBuilder for AMQPBrokerBuilder {
         self
     }
 
+    /// Declare a exclusive queue.
+    fn declare_exclusive_queue(mut self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder> {
+        if !self.config.queues.contains_key(name) {
+            self.config.queues.insert(
+                name.into(),
+                QueueConfig {
+                    options: QueueDeclareOptions {
+                        passive: false,
+                        durable: false,
+                        exclusive: true,
+                        auto_delete: false,
+                        nowait: false,
+                    },
+                    expire_time_ms: None,
+                    message_ttl_ms: None,
+                },
+            );
+        }
+        self
+    }
+
     /// Set the heartbeat.
     fn heartbeat(mut self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder> {
         self.config.heartbeat = heartbeat;
@@ -179,6 +200,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
     ) -> Box<dyn BrokerBuilder> {
         if let Some(config) = self.config.queues.get_mut(queue_name) {
             config.expire_time_ms = Some(queue_expire_time_ms);
+            config.options.durable = queue_expire_time_ms != 0;
             config.options.auto_delete = queue_expire_time_ms != 0;
         }
         self
