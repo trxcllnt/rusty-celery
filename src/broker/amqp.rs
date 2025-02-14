@@ -77,10 +77,30 @@ impl Stream for Consumer {
     }
 }
 
+#[derive(Clone)]
+struct QueueConfig {
+    options: QueueDeclareOptions,
+    expire_time_ms: Option<u32>,
+    message_ttl_ms: Option<u32>,
+}
+
+impl From<&QueueConfig> for FieldTable {
+    fn from(config: &QueueConfig) -> FieldTable {
+        let mut fields = FieldTable::default();
+        if let Some(expire_time_ms) = config.expire_time_ms {
+            fields.insert("x-expires".into(), AMQPValue::LongUInt(expire_time_ms));
+        }
+        if let Some(message_ttl_ms) = config.message_ttl_ms {
+            fields.insert("x-message-ttl".into(), AMQPValue::LongUInt(message_ttl_ms));
+        }
+        fields
+    }
+}
+
 struct Config {
     broker_url: String,
     prefetch_count: u16,
-    queues: HashMap<String, QueueDeclareOptions>,
+    queues: HashMap<String, QueueConfig>,
     heartbeat: Option<u16>,
 }
 
@@ -126,22 +146,53 @@ impl BrokerBuilder for AMQPBrokerBuilder {
 
     /// Declare a queue.
     fn declare_queue(mut self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder> {
-        self.config.queues.insert(
-            name.into(),
-            QueueDeclareOptions {
-                passive: false,
-                durable: true,
-                exclusive: false,
-                auto_delete: false,
-                nowait: false,
-            },
-        );
+        if !self.config.queues.contains_key(name) {
+            self.config.queues.insert(
+                name.into(),
+                QueueConfig {
+                    options: QueueDeclareOptions {
+                        passive: false,
+                        durable: true,
+                        exclusive: false,
+                        auto_delete: false,
+                        nowait: false,
+                    },
+                    expire_time_ms: None,
+                    message_ttl_ms: None,
+                },
+            );
+        }
         self
     }
 
     /// Set the heartbeat.
     fn heartbeat(mut self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder> {
         self.config.heartbeat = heartbeat;
+        self
+    }
+
+    /// Set the per-queue expiry time.
+    fn queue_expire_time(
+        mut self: Box<Self>,
+        queue_name: &str,
+        queue_expire_time_ms: u32,
+    ) -> Box<dyn BrokerBuilder> {
+        if let Some(config) = self.config.queues.get_mut(queue_name) {
+            config.expire_time_ms = Some(queue_expire_time_ms);
+            config.options.auto_delete = queue_expire_time_ms != 0;
+        }
+        self
+    }
+
+    /// Set the per-queue message TTL.
+    fn queue_message_ttl(
+        mut self: Box<Self>,
+        queue_name: &str,
+        queue_message_ttl_ms: u32,
+    ) -> Box<dyn BrokerBuilder> {
+        if let Some(config) = self.config.queues.get_mut(queue_name) {
+            config.message_ttl_ms = Some(queue_message_ttl_ms);
+        }
         self
     }
 
@@ -158,9 +209,9 @@ impl BrokerBuilder for AMQPBrokerBuilder {
         let produce_channel = conn.create_channel().await?;
 
         let mut queues: HashMap<String, Queue> = HashMap::new();
-        for (queue_name, queue_options) in &self.config.queues {
+        for (queue_name, queue_config) in &self.config.queues {
             let queue = consume_channel
-                .queue_declare(queue_name, *queue_options, FieldTable::default())
+                .queue_declare(queue_name, queue_config.options, queue_config.into())
                 .await?;
             queues.insert(queue_name.into(), queue);
         }
@@ -203,7 +254,7 @@ pub struct AMQPBroker {
     /// This is only wrapped in RwLock for interior mutability.
     queues: RwLock<HashMap<String, Queue>>,
 
-    queue_declare_options: HashMap<String, QueueDeclareOptions>,
+    queue_declare_options: HashMap<String, QueueConfig>,
 
     /// Need to keep track of prefetch count. We put this behind a mutex to get interior
     /// mutability.
@@ -377,9 +428,9 @@ impl Broker for AMQPBroker {
             *produce_channel = conn.create_channel().await?;
 
             queues.clear();
-            for (queue_name, queue_options) in &self.queue_declare_options {
+            for (queue_name, queue_config) in &self.queue_declare_options {
                 let queue = consume_channel
-                    .queue_declare(queue_name, *queue_options, FieldTable::default())
+                    .queue_declare(queue_name, queue_config.options, queue_config.into())
                     .await?;
                 queues.insert(queue_name.into(), queue);
             }

@@ -73,6 +73,26 @@ impl BrokerBuilder for RedisBrokerBuilder {
         self
     }
 
+    /// Set the per-queue expiry time.
+    fn queue_expire_time(
+        self: Box<Self>,
+        _queue_name: &str,
+        _queue_expire_time_ms: u32,
+    ) -> Box<dyn BrokerBuilder> {
+        warn!("Setting queue_expire_time on redis broker has no effect on anything");
+        self
+    }
+
+    /// Set the per-queue message TTL.
+    fn queue_message_ttl(
+        self: Box<Self>,
+        _queue_name: &str,
+        _queue_message_ttl_ms: u32,
+    ) -> Box<dyn BrokerBuilder> {
+        warn!("Setting queue_message_ttl on redis broker has no effect on anything");
+        self
+    }
+
     /// Construct the `Broker` with the given configuration.
     async fn build(&self, _connection_timeout: u32) -> Result<Box<dyn Broker>, BrokerError> {
         let mut queues: HashSet<String> = HashSet::new();
