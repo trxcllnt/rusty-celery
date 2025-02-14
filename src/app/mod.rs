@@ -189,6 +189,12 @@ impl CeleryBuilder {
         self
     }
 
+    /// Declare a exclusive queue. The default value depends on the broker implementation.
+    pub fn broker_declare_exclusive_queue(mut self, queue: &str) -> Self {
+        self.config.broker_builder = self.config.broker_builder.declare_exclusive_queue(queue);
+        self
+    }
+
     /// Set the per-queue expiry time. The default value depends on the broker implementation.
     pub fn broker_set_queue_expire_time(
         mut self,

@@ -36,6 +36,11 @@ impl BrokerBuilder for MockBrokerBuilder {
     }
 
     #[allow(unused)]
+    fn declare_exclusive_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder> {
+        self
+    }
+
+    #[allow(unused)]
     fn heartbeat(self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder> {
         self
     }
