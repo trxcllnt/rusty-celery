@@ -206,6 +206,38 @@ impl CeleryBuilder {
         self
     }
 
+    /// Declare a exclusive queue. The default value depends on the broker implementation.
+    pub fn broker_declare_exclusive_queue(mut self, queue: &str) -> Self {
+        self.config.broker_builder = self.config.broker_builder.declare_exclusive_queue(queue);
+        self
+    }
+
+    /// Set the per-queue expiry time. The default value depends on the broker implementation.
+    pub fn broker_set_queue_expire_time(
+        mut self,
+        queue_name: &str,
+        queue_expire_time_ms: u32,
+    ) -> Self {
+        self.config.broker_builder = self
+            .config
+            .broker_builder
+            .queue_expire_time(queue_name, queue_expire_time_ms);
+        self
+    }
+
+    /// Set the per-queue message TTL. The default value depends on the broker implementation.
+    pub fn broker_set_queue_message_ttl(
+        mut self,
+        queue_name: &str,
+        queue_message_ttl_ms: u32,
+    ) -> Self {
+        self.config.broker_builder = self
+            .config
+            .broker_builder
+            .queue_message_ttl(queue_name, queue_message_ttl_ms);
+        self
+    }
+
     /// Construct a [`Celery`] app with the current configuration.
     pub async fn build(self) -> Result<Celery, CeleryError> {
         // Check if we have a valid configuration.

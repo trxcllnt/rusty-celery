@@ -122,8 +122,25 @@ pub trait BrokerBuilder: Send + Sync {
     /// Declare a queue.
     fn declare_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder>;
 
+    /// Declare a exclusive queue.
+    fn declare_exclusive_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder>;
+
     /// Set the heartbeat.
     fn heartbeat(self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder>;
+
+    /// Set the per-queue expiry time.
+    fn queue_expire_time(
+        self: Box<Self>,
+        queue_name: &str,
+        queue_expire_time_ms: u32,
+    ) -> Box<dyn BrokerBuilder>;
+
+    /// Set the per-queue message TTL.
+    fn queue_message_ttl(
+        self: Box<Self>,
+        queue_name: &str,
+        queue_message_ttl_ms: u32,
+    ) -> Box<dyn BrokerBuilder>;
 
     /// Construct the `Broker` with the given configuration.
     async fn build(&self, connection_timeout: u32) -> Result<Box<dyn Broker>, BrokerError>;
