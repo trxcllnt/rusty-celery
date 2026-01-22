@@ -446,6 +446,7 @@ where
     }
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn is_leap_year(year: Ordinal) -> bool {
     let by_four = year % 4 == 0;
     let by_hundred = year % 100 == 0;

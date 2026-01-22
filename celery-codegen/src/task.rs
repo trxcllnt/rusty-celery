@@ -15,6 +15,7 @@ struct TaskAttrs {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum TaskAttr {
     Name(syn::LitStr),
     Wrapper(syn::Ident),
@@ -760,11 +761,6 @@ impl ToTokens for Task {
             None => quote! {},
         };
 
-        let dummy_const = syn::Ident::new(
-            &format!("__IMPL_CELERY_TASK_FOR_{wrapper}"),
-            Span::call_site(),
-        );
-
         let output = quote! {
             #wrapper_struct
 
@@ -776,62 +772,58 @@ impl ToTokens for Task {
                 #serialized_fields
             }
 
-            const #dummy_const: () = {
-                use #export::async_trait;
+            #[#export::async_trait]
+            impl #krate::task::Task for #wrapper {
+                const NAME: &'static str = #task_name;
+                const ARGS: &'static [&'static str] = &[#arg_names];
+                const DEFAULTS: #krate::task::TaskOptions = #krate::task::TaskOptions {
+                    time_limit: #time_limit,
+                    hard_time_limit: #hard_time_limit,
+                    expires: #expires,
+                    max_retries: #max_retries,
+                    min_retry_delay: #min_retry_delay,
+                    max_retry_delay: #max_retry_delay,
+                    retry_for_unexpected: #retry_for_unexpected,
+                    acks_late: #acks_late,
+                    acks_on_failure_or_timeout: #acks_on_failure_or_timeout,
+                    nacks_enabled: #nacks_enabled,
+                    content_type: #content_type,
+                };
 
-                #[async_trait]
-                impl #krate::task::Task for #wrapper {
-                    const NAME: &'static str = #task_name;
-                    const ARGS: &'static [&'static str] = &[#arg_names];
-                    const DEFAULTS: #krate::task::TaskOptions = #krate::task::TaskOptions {
-                        time_limit: #time_limit,
-                        hard_time_limit: #hard_time_limit,
-                        expires: #expires,
-                        max_retries: #max_retries,
-                        min_retry_delay: #min_retry_delay,
-                        max_retry_delay: #max_retry_delay,
-                        retry_for_unexpected: #retry_for_unexpected,
-                        acks_late: #acks_late,
-                        acks_on_failure_or_timeout: #acks_on_failure_or_timeout,
-                        nacks_enabled: #nacks_enabled,
-                        content_type: #content_type,
-                    };
+                type Params = #params_type;
+                type Returns = <#return_type as #krate::task::AsTaskResult>::Returns;
 
-                    type Params = #params_type;
-                    type Returns = <#return_type as #krate::task::AsTaskResult>::Returns;
-
-                    fn from_request(
-                        request: #krate::task::Request<Self>,
-                        options: #krate::task::TaskOptions,
-                    ) -> Self {
-                        Self { request, options }
-                    }
-
-                    fn request(&self) -> &#krate::task::Request<Self> {
-                        &self.request
-                    }
-
-                    fn options(&self) -> &#krate::task::TaskOptions {
-                        &self.options
-                    }
-
-                    #[allow(unused_variables)]
-                    async fn run(&self, params: Self::Params) -> #return_type {
-                        #deserialized_bindings
-                        #call_run_implementation
-                    }
-
-                    #[allow(unused_variables)]
-                    async fn on_failure(&self, err: &#krate::error::TaskError) {
-                        #call_on_failure
-                    }
-
-                    #[allow(unused_variables)]
-                    async fn on_success(&self, returned: &Self::Returns) {
-                        #call_on_success
-                    }
+                fn from_request(
+                    request: #krate::task::Request<Self>,
+                    options: #krate::task::TaskOptions,
+                ) -> Self {
+                    Self { request, options }
                 }
-            };
+
+                fn request(&self) -> &#krate::task::Request<Self> {
+                    &self.request
+                }
+
+                fn options(&self) -> &#krate::task::TaskOptions {
+                    &self.options
+                }
+
+                #[allow(unused_variables)]
+                async fn run(&self, params: Self::Params) -> #return_type {
+                    #deserialized_bindings
+                    #call_run_implementation
+                }
+
+                #[allow(unused_variables)]
+                async fn on_failure(&self, err: &#krate::error::TaskError) {
+                    #call_on_failure
+                }
+
+                #[allow(unused_variables)]
+                async fn on_success(&self, returned: &Self::Returns) {
+                    #call_on_success
+                }
+            }
         };
         dst.extend(output);
     }
