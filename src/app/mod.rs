@@ -512,7 +512,7 @@ impl Celery {
                 )
                 .await?;
 
-                return Err(Box::new(e));
+                return Err(Box::new(e) as Box<dyn Error + Send + Sync + 'static>);
             }
         };
 
