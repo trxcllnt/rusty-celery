@@ -86,6 +86,18 @@ struct QueueConfig {
     options: QueueDeclareOptions,
     expire_time_ms: Option<u32>,
     message_ttl_ms: Option<u32>,
+    queue_type: Option<String>,
+}
+
+impl From<&QueueConfig> for QueueDeclareOptions {
+    fn from(config: &QueueConfig) -> Self {
+        let mut options = config.options;
+        if let Some("quorum") = config.queue_type.as_deref() {
+            options.durable = true;
+            options.exclusive = false;
+        }
+        options
+    }
 }
 
 impl From<&QueueConfig> for FieldTable {
@@ -97,6 +109,10 @@ impl From<&QueueConfig> for FieldTable {
         if let Some(message_ttl_ms) = config.message_ttl_ms {
             fields.insert("x-message-ttl".into(), AMQPValue::LongUInt(message_ttl_ms));
         }
+        fields.insert(
+            "x-queue-type".into(),
+            AMQPValue::LongString(config.queue_type.as_deref().unwrap_or("classic").into()),
+        );
         fields
     }
 }
@@ -163,6 +179,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
                     },
                     expire_time_ms: None,
                     message_ttl_ms: None,
+                    queue_type: None,
                 },
             );
         }
@@ -184,6 +201,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
                     },
                     expire_time_ms: None,
                     message_ttl_ms: None,
+                    queue_type: None,
                 },
             );
         }
@@ -197,7 +215,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
     }
 
     /// Set the per-queue expiry time.
-    fn queue_expire_time(
+    fn set_queue_expire_time(
         mut self: Box<Self>,
         queue_name: &str,
         queue_expire_time_ms: u32,
@@ -211,13 +229,25 @@ impl BrokerBuilder for AMQPBrokerBuilder {
     }
 
     /// Set the per-queue message TTL.
-    fn queue_message_ttl(
+    fn set_queue_message_ttl(
         mut self: Box<Self>,
         queue_name: &str,
         queue_message_ttl_ms: u32,
     ) -> Box<dyn BrokerBuilder> {
         if let Some(config) = self.config.queues.get_mut(queue_name) {
             config.message_ttl_ms = Some(queue_message_ttl_ms);
+        }
+        self
+    }
+
+    /// Set the queue type.
+    fn set_queue_type(
+        mut self: Box<Self>,
+        queue_name: &str,
+        queue_type: &str,
+    ) -> Box<dyn BrokerBuilder> {
+        if let Some(config) = self.config.queues.get_mut(queue_name) {
+            config.queue_type = Some(queue_type.to_string());
         }
         self
     }
@@ -237,7 +267,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
         let mut queues: HashMap<String, Queue> = HashMap::new();
         for (queue_name, queue_config) in &self.config.queues {
             let queue = consume_channel
-                .queue_declare(queue_name, queue_config.options, queue_config.into())
+                .queue_declare(queue_name, queue_config.into(), queue_config.into())
                 .await?;
             queues.insert(queue_name.into(), queue);
         }
@@ -293,7 +323,7 @@ impl AMQPBroker {
         self.consume_channel
             .read()
             .await
-            .basic_qos(prefetch_count, BasicQosOptions { global: true })
+            .basic_qos(prefetch_count, BasicQosOptions { global: false })
             .await?;
         Ok(())
     }
@@ -460,7 +490,7 @@ impl Broker for AMQPBroker {
             queues.clear();
             for (queue_name, queue_config) in &self.queue_declare_options {
                 let queue = consume_channel
-                    .queue_declare(queue_name, queue_config.options, queue_config.into())
+                    .queue_declare(queue_name, queue_config.into(), queue_config.into())
                     .await?;
                 queues.insert(queue_name.into(), queue);
             }

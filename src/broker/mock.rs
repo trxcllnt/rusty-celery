@@ -46,7 +46,7 @@ impl BrokerBuilder for MockBrokerBuilder {
     }
 
     #[allow(unused)]
-    fn queue_expire_time(
+    fn set_queue_expire_time(
         self: Box<Self>,
         queue_name: &str,
         queue_expire_time_ms: u32,
@@ -55,10 +55,19 @@ impl BrokerBuilder for MockBrokerBuilder {
     }
 
     #[allow(unused)]
-    fn queue_message_ttl(
+    fn set_queue_message_ttl(
         self: Box<Self>,
         queue_name: &str,
         queue_message_ttl_ms: u32,
+    ) -> Box<dyn BrokerBuilder> {
+        self
+    }
+
+    #[allow(unused)]
+    fn set_queue_type(
+        self: Box<Self>,
+        queue_name: &str,
+        queue_type: &str,
     ) -> Box<dyn BrokerBuilder> {
         self
     }

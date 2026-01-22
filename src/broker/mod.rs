@@ -129,17 +129,24 @@ pub trait BrokerBuilder: Send + Sync {
     fn heartbeat(self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder>;
 
     /// Set the per-queue expiry time.
-    fn queue_expire_time(
+    fn set_queue_expire_time(
         self: Box<Self>,
         queue_name: &str,
         queue_expire_time_ms: u32,
     ) -> Box<dyn BrokerBuilder>;
 
     /// Set the per-queue message TTL.
-    fn queue_message_ttl(
+    fn set_queue_message_ttl(
         self: Box<Self>,
         queue_name: &str,
         queue_message_ttl_ms: u32,
+    ) -> Box<dyn BrokerBuilder>;
+
+    /// Set the queue type.
+    fn set_queue_type(
+        self: Box<Self>,
+        queue_name: &str,
+        queue_type: &str,
     ) -> Box<dyn BrokerBuilder>;
 
     /// Construct the `Broker` with the given configuration.

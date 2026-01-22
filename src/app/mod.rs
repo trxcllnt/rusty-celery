@@ -206,6 +206,12 @@ impl CeleryBuilder {
         self
     }
 
+    /// Declare a queue. The default value depends on the broker implementation.
+    pub fn broker_declare_queue(mut self, queue: &str) -> Self {
+        self.config.broker_builder = self.config.broker_builder.declare_queue(queue);
+        self
+    }
+
     /// Declare a exclusive queue. The default value depends on the broker implementation.
     pub fn broker_declare_exclusive_queue(mut self, queue: &str) -> Self {
         self.config.broker_builder = self.config.broker_builder.declare_exclusive_queue(queue);
@@ -221,7 +227,7 @@ impl CeleryBuilder {
         self.config.broker_builder = self
             .config
             .broker_builder
-            .queue_expire_time(queue_name, queue_expire_time_ms);
+            .set_queue_expire_time(queue_name, queue_expire_time_ms);
         self
     }
 
@@ -234,7 +240,16 @@ impl CeleryBuilder {
         self.config.broker_builder = self
             .config
             .broker_builder
-            .queue_message_ttl(queue_name, queue_message_ttl_ms);
+            .set_queue_message_ttl(queue_name, queue_message_ttl_ms);
+        self
+    }
+
+    /// Set the queue type. The default value depends on the broker implementation.
+    pub fn broker_set_queue_type(mut self, queue_name: &str, queue_type: &str) -> Self {
+        self.config.broker_builder = self
+            .config
+            .broker_builder
+            .set_queue_type(queue_name, queue_type);
         self
     }
 
