@@ -2,7 +2,7 @@
 //! The implementation is inspired by the
 //! [cron crate](https://crates.io/crates/cron).
 
-use chrono::{offset::Utc, TimeZone};
+use chrono::{TimeZone, offset::Utc};
 use std::time::SystemTime;
 
 use super::Schedule;
@@ -10,7 +10,7 @@ use crate::error::ScheduleError;
 
 mod parsing;
 mod time_units;
-use parsing::{parse_longhand, parse_shorthand, CronParsingError, Shorthand};
+use parsing::{CronParsingError, Shorthand, parse_longhand, parse_shorthand};
 use time_units::{Hours, Minutes, MonthDays, Months, TimeUnitField, WeekDays};
 
 /// The maximum year supported by a `CronSchedule`.

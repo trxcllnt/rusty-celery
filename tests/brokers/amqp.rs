@@ -64,6 +64,7 @@ impl Task for add {
 
 #[tokio::test]
 async fn test_amqp_broker() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let my_app = celery::app!(
         broker = AMQPBroker { std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1:5672//".into()) },
         tasks = [add],
@@ -73,14 +74,16 @@ async fn test_amqp_broker() {
             "ml.*" => "ml"
         ],
     ).await.unwrap();
-
+    println!("Initialized broker");
     // Send task to queue.
     let send_result = my_app.send_task(add::new(1, 2)).await;
     assert!(send_result.is_ok());
+    println!("Sent task");
     let task_id_1 = send_result.unwrap().task_id;
 
     // Consume task from queue. We wrap this in `time::timeout(...)` because otherwise
     // `consume` will keep waiting for more tasks indefinitely.
+    println!("Awaiting result");
     let result = time::timeout(Duration::from_secs(1), my_app.consume()).await;
 
     // `result` should be a timeout error, otherwise `consume` ended early which means
@@ -88,7 +91,12 @@ async fn test_amqp_broker() {
     assert!(result.is_err());
 
     // Try closing connection and then reconnecting.
+    println!("Close broker");
     my_app.broker.close().await.unwrap();
+    // Assert connection actually closed.
+    let res = my_app.send_task(add::new(1, 2)).await;
+    assert!(res.is_err());
+    println!("reconnect");
     my_app.broker.reconnect(500).await.unwrap();
 
     // Send another task to the queue.

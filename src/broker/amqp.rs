@@ -2,15 +2,15 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
-use futures::Stream;
+use futures::{Stream, TryStreamExt};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicNackOptions,
-    BasicPublishOptions, BasicQosOptions, QueueDeclareOptions,
+    BasicPublishOptions, BasicQosOptions, ExchangeDeclareOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldArray, FieldTable};
 use lapin::uri::{self, AMQPUri};
-use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Queue};
+use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind, Queue};
 use log::debug;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -29,7 +29,11 @@ struct Consumer {
     wrapped: lapin::Consumer,
 }
 impl DeliveryStream for Consumer {}
-impl DeliveryError for lapin::Error {}
+impl DeliveryError for lapin::Error {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send + Sync> {
+        self
+    }
+}
 
 #[async_trait]
 impl super::Delivery for Delivery {
@@ -42,7 +46,7 @@ impl super::Delivery for Delivery {
         message.headers.eta = eta;
         // Increment the number of retries.
         message.headers.retries = Some(message.headers.retries.map_or(1, |retry| retry + 1));
-        broker.send(&message, self.routing_key.as_str()).await
+        broker.send(message, self.routing_key.as_str()).await
     }
     async fn remove(&self) -> Result<(), BrokerError> {
         todo!()
@@ -81,12 +85,25 @@ impl Stream for Consumer {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct QueueConfig {
     options: QueueDeclareOptions,
+    broadcast: bool,
     expire_time_ms: Option<u32>,
     message_ttl_ms: Option<u32>,
     queue_type: Option<String>,
+}
+
+impl From<&QueueConfig> for ExchangeDeclareOptions {
+    fn from(config: &QueueConfig) -> Self {
+        ExchangeDeclareOptions {
+            passive: config.options.passive,
+            durable: config.options.durable,
+            auto_delete: config.options.auto_delete,
+            nowait: config.options.nowait,
+            ..Default::default()
+        }
+    }
 }
 
 impl From<&QueueConfig> for QueueDeclareOptions {
@@ -177,9 +194,28 @@ impl BrokerBuilder for AMQPBrokerBuilder {
                         auto_delete: false,
                         nowait: false,
                     },
-                    expire_time_ms: None,
-                    message_ttl_ms: None,
-                    queue_type: None,
+                    ..Default::default()
+                },
+            );
+        }
+        self
+    }
+
+    /// Declare a broadcast queue.
+    fn declare_broadcast_queue(mut self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder> {
+        if !self.config.queues.contains_key(name) {
+            self.config.queues.insert(
+                name.into(),
+                QueueConfig {
+                    options: QueueDeclareOptions {
+                        passive: false,
+                        durable: false,
+                        exclusive: true,
+                        auto_delete: false,
+                        nowait: false,
+                    },
+                    broadcast: true,
+                    ..Default::default()
                 },
             );
         }
@@ -199,9 +235,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
                         auto_delete: false,
                         nowait: false,
                     },
-                    expire_time_ms: None,
-                    message_ttl_ms: None,
-                    queue_type: None,
+                    ..Default::default()
                 },
             );
         }
@@ -263,14 +297,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
 
         let consume_channel = conn.create_channel().await?;
         let produce_channel = conn.create_channel().await?;
-
-        let mut queues: HashMap<String, Queue> = HashMap::new();
-        for (queue_name, queue_config) in &self.config.queues {
-            let queue = consume_channel
-                .queue_declare(queue_name, queue_config.into(), queue_config.into())
-                .await?;
-            queues.insert(queue_name.into(), queue);
-        }
+        let queues = declare_queues(&consume_channel, &self.config.queues).await?;
 
         let broker = AMQPBroker {
             uri,
@@ -308,7 +335,7 @@ pub struct AMQPBroker {
     /// Mapping of queue name to Queue struct.
     ///
     /// This is only wrapped in RwLock for interior mutability.
-    queues: RwLock<HashMap<String, Queue>>,
+    queues: RwLock<HashMap<String, Box<dyn AMQPQueue>>>,
 
     queue_declare_options: HashMap<String, QueueConfig>,
 
@@ -332,17 +359,7 @@ impl AMQPBroker {
 #[async_trait]
 impl Broker for AMQPBroker {
     fn safe_url(&self) -> String {
-        format!(
-            "{}://{}:***@{}:{}/{}",
-            match self.uri.scheme {
-                uri::AMQPScheme::AMQP => "amqp",
-                _ => "amqps",
-            },
-            self.uri.authority.userinfo.username,
-            self.uri.authority.host,
-            self.uri.authority.port,
-            self.uri.vhost,
-        )
+        safe_url(&self.uri)
     }
 
     async fn consume(
@@ -364,7 +381,7 @@ impl Broker for AMQPBroker {
                 .read()
                 .await
                 .basic_consume(
-                    queue.name().as_str(),
+                    queue.name(),
                     "",
                     BasicConsumeOptions::default(),
                     FieldTable::default(),
@@ -399,21 +416,15 @@ impl Broker for AMQPBroker {
         Ok(())
     }
 
-    async fn send(&self, message: &Message, queue: &str) -> Result<(), BrokerError> {
-        let properties = message.delivery_properties();
-        debug!("Sending AMQP message with: {:?}", properties);
-        self.produce_channel
+    async fn send(&self, message: Message, queue: &str) -> Result<(), BrokerError> {
+        let produce_channel = self.produce_channel.read().await;
+        self.queues
             .read()
             .await
-            .basic_publish(
-                "",
-                queue,
-                BasicPublishOptions::default(),
-                &message.raw_body.clone()[..],
-                properties,
-            )
-            .await?;
-        Ok(())
+            .get(queue)
+            .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?
+            .send(&produce_channel, message)
+            .await
     }
 
     async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
@@ -486,14 +497,7 @@ impl Broker for AMQPBroker {
 
             *consume_channel = conn.create_channel().await?;
             *produce_channel = conn.create_channel().await?;
-
-            queues.clear();
-            for (queue_name, queue_config) in &self.queue_declare_options {
-                let queue = consume_channel
-                    .queue_declare(queue_name, queue_config.into(), queue_config.into())
-                    .await?;
-                queues.insert(queue_name.into(), queue);
-            }
+            *queues = declare_queues(&consume_channel, &self.queue_declare_options).await?;
         }
 
         Ok(())
@@ -502,6 +506,166 @@ impl Broker for AMQPBroker {
     #[cfg(test)]
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+}
+
+async fn declare_queues(
+    consume_channel: &Channel,
+    queues: &HashMap<String, QueueConfig>,
+) -> Result<HashMap<String, Box<dyn AMQPQueue>>, BrokerError> {
+    futures::stream::iter(queues.iter().map(Ok))
+        .and_then(|(queue, config)| async move {
+            Ok((
+                queue.clone(),
+                if config.broadcast {
+                    BroadcastQueue::new_boxed(consume_channel, queue, config).await?
+                } else {
+                    CooperativeQueue::new_boxed(consume_channel, queue, config).await?
+                },
+            ))
+        })
+        .try_collect()
+        .await
+}
+
+fn safe_url(uri: &AMQPUri) -> String {
+    format!(
+        "{}://{}:***@{}:{}/{}",
+        match uri.scheme {
+            uri::AMQPScheme::AMQP => "amqp",
+            _ => "amqps",
+        },
+        uri.authority.userinfo.username,
+        uri.authority.host,
+        uri.authority.port,
+        uri.vhost,
+    )
+}
+
+#[async_trait]
+trait AMQPQueue: Send + Sync {
+    fn inner(&self) -> &Queue;
+
+    fn name(&self) -> &str {
+        self.inner().name().as_str()
+    }
+
+    async fn send(&self, produce_channel: &Channel, message: Message) -> Result<(), BrokerError>;
+}
+
+struct CooperativeQueue {
+    inner: Queue,
+}
+
+impl CooperativeQueue {
+    async fn new_boxed(
+        consume_channel: &Channel,
+        queue: &str,
+        config: &QueueConfig,
+    ) -> Result<Box<dyn AMQPQueue>, BrokerError> {
+        Ok(Box::new(Self {
+            inner: consume_channel
+                .queue_declare(queue, config.into(), config.into())
+                .await?,
+        }))
+    }
+}
+
+#[async_trait]
+impl AMQPQueue for CooperativeQueue {
+    fn inner(&self) -> &Queue {
+        &self.inner
+    }
+
+    async fn send(&self, produce_channel: &Channel, message: Message) -> Result<(), BrokerError> {
+        let properties = message.delivery_properties();
+        debug!("Sending AMQP message with: {properties:?}");
+        produce_channel
+            .basic_publish(
+                "",
+                self.name(),
+                BasicPublishOptions::default(),
+                &message.raw_body.clone()[..],
+                properties,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+struct BroadcastQueue {
+    inner: Queue,
+    queue: String,
+}
+
+impl BroadcastQueue {
+    async fn new_boxed(
+        consume_channel: &Channel,
+        queue: &str,
+        config: &QueueConfig,
+    ) -> Result<Box<dyn AMQPQueue>, BrokerError> {
+        // Declare the fanout exchange
+        consume_channel
+            .exchange_declare(
+                queue, // use the queue name as the exchange name
+                ExchangeKind::Fanout,
+                config.into(),
+                Default::default(),
+            )
+            .await?;
+
+        // Declare an anonymous exclusive queue to receive broadcasts
+        let inner = consume_channel
+            .queue_declare(
+                "",
+                QueueDeclareOptions {
+                    exclusive: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await?;
+
+        // Bind the anonymous queue to the fanout exchange
+        consume_channel
+            .queue_bind(
+                inner.name().as_str(),
+                queue,
+                "",
+                Default::default(),
+                Default::default(),
+            )
+            .await?;
+
+        Ok(Box::new(Self {
+            inner,
+            queue: queue.to_owned(),
+        }))
+    }
+}
+
+#[async_trait]
+impl AMQPQueue for BroadcastQueue {
+    fn inner(&self) -> &Queue {
+        &self.inner
+    }
+
+    async fn send(&self, produce_channel: &Channel, message: Message) -> Result<(), BrokerError> {
+        let properties = message.delivery_properties();
+        debug!(
+            "Broadcasting AMQP message to {name:?} with: {properties:?}",
+            name = self.queue
+        );
+        produce_channel
+            .basic_publish(
+                self.queue.as_str(),
+                "",
+                BasicPublishOptions::default(),
+                &message.raw_body.clone()[..],
+                properties,
+            )
+            .await?;
+        Ok(())
     }
 }
 

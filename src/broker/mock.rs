@@ -6,8 +6,8 @@ use crate::protocol::{Message, TryDeserializeMessage};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::{
-    task::{Context, Poll},
     Stream,
+    task::{Context, Poll},
 };
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -32,6 +32,11 @@ impl BrokerBuilder for MockBrokerBuilder {
 
     #[allow(unused)]
     fn declare_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder> {
+        self
+    }
+
+    #[allow(unused)]
+    fn declare_broadcast_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder> {
         self
     }
 
@@ -136,7 +141,7 @@ impl Broker for MockBroker {
     }
 
     #[allow(unused)]
-    async fn send(&self, message: &Message, queue: &str) -> Result<(), BrokerError> {
+    async fn send(&self, message: Message, queue: &str) -> Result<(), BrokerError> {
         self.sent_tasks.write().await.insert(
             message.task_id().into(),
             (message.clone(), queue.into(), SystemTime::now()),

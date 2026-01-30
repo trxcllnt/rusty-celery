@@ -64,6 +64,7 @@ impl Task for add {
 
 #[tokio::test]
 async fn test_redis_broker() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     println!("Starting broker");
     let my_app = celery::app!(
         broker = RedisBroker { std::env::var("REDIS_ADDR").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into()) },

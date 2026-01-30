@@ -4,10 +4,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{self, Duration, Instant};
 
+use crate::Celery;
 use crate::error::{ProtocolError, TaskError, TraceError};
 use crate::protocol::Message;
 use crate::task::{Request, Task, TaskEvent, TaskOptions, TaskStatus};
-use crate::Celery;
 
 /// A `Tracer` provides the API through which a `Celery` application interacts with its tasks.
 ///
@@ -63,7 +63,10 @@ where
             .unwrap_or_else(|_| {
                 // This really shouldn't happen. If it does, there's probably much
                 // bigger things to worry about like running out of memory.
-                error!("Failed sending task event");
+                error!(
+                    "Failed sending task event: {:?}",
+                    TaskEvent::StatusChange(TaskStatus::Pending)
+                );
             });
 
         let start = Instant::now();
@@ -75,7 +78,14 @@ where
                     .await
                     .unwrap_or(Err(TaskError::TimeoutError))
             }
-            None => self.task.run(self.task.request().params.clone()).await,
+            None => {
+                debug!(
+                    "Running task {}[{}]",
+                    self.task.name(),
+                    &self.task.request().id,
+                );
+                self.task.run(self.task.request().params.clone()).await
+            }
         };
         let duration = start.elapsed();
 
@@ -95,7 +105,10 @@ where
                 self.event_tx
                     .send(TaskEvent::StatusChange(TaskStatus::Finished))
                     .unwrap_or_else(|_| {
-                        error!("Failed sending task event");
+                        error!(
+                            "Failed sending task event: {:?}",
+                            TaskEvent::StatusChange(TaskStatus::Finished)
+                        );
                     });
 
                 Ok(())
@@ -145,7 +158,10 @@ where
                 self.event_tx
                     .send(TaskEvent::StatusChange(TaskStatus::Finished))
                     .unwrap_or_else(|_| {
-                        error!("Failed sending task event");
+                        error!(
+                            "Failed sending task event: {:?}",
+                            TaskEvent::StatusChange(TaskStatus::Finished)
+                        );
                     });
 
                 if !should_retry {

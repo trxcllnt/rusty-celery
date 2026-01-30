@@ -1,4 +1,4 @@
-use super::{scheduled_task::ScheduledTask, Schedule};
+use super::{Schedule, scheduled_task::ScheduledTask};
 use crate::{broker::Broker, error::BeatError, protocol::TryCreateMessage};
 use log::{debug, info};
 use std::collections::BinaryHeap;
@@ -122,7 +122,7 @@ impl Scheduler {
             message.task_id(),
             queue
         );
-        self.broker.send(&message, queue).await?;
+        self.broker.send(message, queue).await?;
         scheduled_task.last_run_at.replace(SystemTime::now());
         scheduled_task.total_run_count += 1;
         Ok(())

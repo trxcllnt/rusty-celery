@@ -5,7 +5,7 @@ pub struct AsyncResult {
 }
 
 impl AsyncResult {
-    pub fn new(task_id: &str) -> Self {
+    pub fn new<S: Into<String>>(task_id: S) -> Self {
         Self {
             task_id: task_id.into(),
         }

@@ -1,7 +1,7 @@
 use super::Task;
+use crate::Celery;
 use crate::error::ProtocolError;
 use crate::protocol::Message;
-use crate::Celery;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::SystemTime;

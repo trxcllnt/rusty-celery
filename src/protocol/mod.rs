@@ -5,15 +5,14 @@
 //! type must implement [`TryCreateMessage`].
 
 use base64::{
-    alphabet,
-    engine::{general_purpose::PAD, GeneralPurpose},
-    Engine,
+    Engine, alphabet,
+    engine::{GeneralPurpose, general_purpose::PAD},
 };
 use chrono::{DateTime, Duration, Utc};
 use log::{debug, warn};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_slice, from_value, json, Value};
+use serde_json::{Value, from_slice, from_value, json};
 use std::convert::TryFrom;
 use std::process;
 use std::time::SystemTime;
@@ -246,7 +245,7 @@ where
 /// Note that the [`raw_body`](Message::raw_body) field is the serialized form of a [`MessageBody`]
 /// so that a worker can read the meta data of a message without having to deserialize the body
 /// first.
-#[derive(Eq, PartialEq, Debug, Clone)]
+#[derive(Default, Eq, PartialEq, Debug, Clone)]
 pub struct Message {
     /// Message properties correspond to the equivalent AMQP delivery properties.
     pub properties: MessageProperties,
@@ -265,148 +264,152 @@ impl Message {
             "application/json" => {
                 let value: Value = from_slice(&self.raw_body)?;
                 debug!("Deserialized message body: {:?}", value);
-                if let Value::Array(ref vec) = value {
-                    if let [Value::Array(ref args), Value::Object(ref kwargs), Value::Object(ref embed)] =
-                        vec[..]
-                    {
-                        if !args.is_empty() {
-                            // Non-empty args, need to try to coerce them into kwargs.
-                            let mut kwargs = kwargs.clone();
-                            let embed = embed.clone();
-                            let arg_names = T::ARGS;
-                            for (i, arg) in args.iter().enumerate() {
-                                if let Some(arg_name) = arg_names.get(i) {
-                                    kwargs.insert((*arg_name).into(), arg.clone());
-                                } else {
-                                    break;
-                                }
-                            }
-                            return Ok(MessageBody(
-                                vec![],
-                                from_value::<T::Params>(Value::Object(kwargs))?,
-                                from_value::<MessageBodyEmbed>(Value::Object(embed))?,
-                            ));
+                if let Value::Array(ref vec) = value
+                    && let [
+                        Value::Array(ref args),
+                        Value::Object(ref kwargs),
+                        Value::Object(ref embed),
+                    ] = vec[..]
+                    && !args.is_empty()
+                {
+                    // Non-empty args, need to try to coerce them into kwargs.
+                    let mut kwargs = kwargs.clone();
+                    let embed = embed.clone();
+                    let arg_names = T::ARGS;
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Some(arg_name) = arg_names.get(i) {
+                            kwargs.insert((*arg_name).into(), arg.clone());
+                        } else {
+                            break;
                         }
                     }
+                    return Ok(MessageBody(
+                        vec![],
+                        from_value::<T::Params>(Value::Object(kwargs))?,
+                        from_value::<MessageBodyEmbed>(Value::Object(embed))?,
+                    ));
                 }
                 Ok(from_value::<MessageBody<T>>(value)?)
             }
             #[cfg(any(test, feature = "extra_content_types"))]
             "application/x-yaml" => {
-                use serde_yaml::{from_slice, from_value, Value};
+                use serde_yaml::{Value, from_slice, from_value};
                 let value: Value = from_slice(&self.raw_body)?;
                 debug!("Deserialized message body: {:?}", value);
-                if let Value::Sequence(ref vec) = value {
-                    if let [Value::Sequence(ref args), Value::Mapping(ref kwargs), Value::Mapping(ref embed)] =
-                        vec[..]
-                    {
-                        if !args.is_empty() {
-                            // Non-empty args, need to try to coerce them into kwargs.
-                            let mut kwargs = kwargs.clone();
-                            let embed = embed.clone();
-                            let arg_names = T::ARGS;
-                            for (i, arg) in args.iter().enumerate() {
-                                if let Some(arg_name) = arg_names.get(i) {
-                                    kwargs.insert((*arg_name).into(), arg.clone());
-                                } else {
-                                    break;
-                                }
-                            }
-                            return Ok(MessageBody(
-                                vec![],
-                                from_value::<T::Params>(Value::Mapping(kwargs))?,
-                                from_value::<MessageBodyEmbed>(Value::Mapping(embed))?,
-                            ));
+                if let Value::Sequence(ref vec) = value
+                    && let [
+                        Value::Sequence(ref args),
+                        Value::Mapping(ref kwargs),
+                        Value::Mapping(ref embed),
+                    ] = vec[..]
+                    && !args.is_empty()
+                {
+                    // Non-empty args, need to try to coerce them into kwargs.
+                    let mut kwargs = kwargs.clone();
+                    let embed = embed.clone();
+                    let arg_names = T::ARGS;
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Some(arg_name) = arg_names.get(i) {
+                            kwargs.insert((*arg_name).into(), arg.clone());
+                        } else {
+                            break;
                         }
                     }
+                    return Ok(MessageBody(
+                        vec![],
+                        from_value::<T::Params>(Value::Mapping(kwargs))?,
+                        from_value::<MessageBodyEmbed>(Value::Mapping(embed))?,
+                    ));
                 }
                 Ok(from_value(value)?)
             }
             #[cfg(any(test, feature = "extra_content_types"))]
             "application/x-python-serialize" => {
-                use serde_pickle::{from_slice, from_value, DeOptions, HashableValue, Value};
+                use serde_pickle::{DeOptions, HashableValue, Value, from_slice, from_value};
                 let value: Value = from_slice(&self.raw_body, DeOptions::new())?;
                 // debug!("Deserialized message body: {:?}", value);
-                if let Value::List(ref vec) = value {
-                    if let [Value::List(ref args), Value::Dict(ref kwargs), Value::Dict(ref embed)] =
-                        vec[..]
-                    {
-                        if !args.is_empty() {
-                            // Non-empty args, need to try to coerce them into kwargs.
-                            let mut kwargs = kwargs.clone();
-                            let embed = embed.clone();
-                            let arg_names = T::ARGS;
-                            for (i, arg) in args.iter().enumerate() {
-                                if let Some(arg_name) = arg_names.get(i) {
-                                    let key = HashableValue::String((*arg_name).into());
-                                    kwargs.insert(key, arg.clone());
-                                } else {
-                                    break;
-                                }
-                            }
-                            return Ok(MessageBody(
-                                vec![],
-                                from_value::<T::Params>(Value::Dict(kwargs))?,
-                                from_value::<MessageBodyEmbed>(Value::Dict(embed))?,
-                            ));
+                if let Value::List(ref vec) = value
+                    && let [
+                        Value::List(ref args),
+                        Value::Dict(ref kwargs),
+                        Value::Dict(ref embed),
+                    ] = vec[..]
+                    && !args.is_empty()
+                {
+                    // Non-empty args, need to try to coerce them into kwargs.
+                    let mut kwargs = kwargs.clone();
+                    let embed = embed.clone();
+                    let arg_names = T::ARGS;
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Some(arg_name) = arg_names.get(i) {
+                            let key = HashableValue::String((*arg_name).into());
+                            kwargs.insert(key, arg.clone());
+                        } else {
+                            break;
                         }
                     }
+                    return Ok(MessageBody(
+                        vec![],
+                        from_value::<T::Params>(Value::Dict(kwargs))?,
+                        from_value::<MessageBodyEmbed>(Value::Dict(embed))?,
+                    ));
                 }
                 Ok(from_value(value)?)
             }
             #[cfg(any(test, feature = "extra_content_types"))]
             "application/x-msgpack" => {
                 use rmp_serde::from_slice;
-                use rmpv::{ext::from_value, Value};
+                use rmpv::{Value, ext::from_value};
                 let value: Value = from_slice(&self.raw_body)?;
                 debug!("Deserialized message body: {:?}", value);
-                if let Value::Array(ref vec) = value {
-                    if let [Value::Array(ref args), Value::Map(ref kwargs), Value::Map(ref embed)] =
-                        vec[..]
-                    {
-                        if !args.is_empty() {
-                            // Non-empty args, need to try to coerce them into kwargs.
-                            let mut kwargs = kwargs.clone();
-                            let embed = embed.clone();
-                            let arg_names = T::ARGS;
-                            for (i, arg) in args.iter().enumerate() {
-                                if let Some(arg_name) = arg_names.get(i) {
-                                    // messagepack is storing the map as a vec where each item
-                                    // is a tuple of (key, value). here we will look for an item
-                                    // with the matching key and replace it, or insert a new entry
-                                    // at the end of the vec
-                                    let existing_entry = kwargs
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, (key, _))| {
-                                            if let Value::String(key) = key {
-                                                if let Some(key) = key.as_str() {
-                                                    key == *arg_name
-                                                } else {
-                                                    false
-                                                }
-                                            } else {
-                                                false
-                                            }
-                                        })
-                                        .map(|(i, _)| i)
-                                        .next();
-                                    if let Some(index) = existing_entry {
-                                        kwargs[index] = ((*arg_name).into(), arg.clone());
+                if let Value::Array(ref vec) = value
+                    && let [
+                        Value::Array(ref args),
+                        Value::Map(ref kwargs),
+                        Value::Map(ref embed),
+                    ] = vec[..]
+                    && !args.is_empty()
+                {
+                    // Non-empty args, need to try to coerce them into kwargs.
+                    let mut kwargs = kwargs.clone();
+                    let embed = embed.clone();
+                    let arg_names = T::ARGS;
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Some(arg_name) = arg_names.get(i) {
+                            // messagepack is storing the map as a vec where each item
+                            // is a tuple of (key, value). here we will look for an item
+                            // with the matching key and replace it, or insert a new entry
+                            // at the end of the vec
+                            let existing_entry = kwargs
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, (key, _))| {
+                                    if let Value::String(key) = key {
+                                        if let Some(key) = key.as_str() {
+                                            key == *arg_name
+                                        } else {
+                                            false
+                                        }
                                     } else {
-                                        kwargs.push(((*arg_name).into(), arg.clone()));
+                                        false
                                     }
-                                } else {
-                                    break;
-                                }
+                                })
+                                .map(|(i, _)| i)
+                                .next();
+                            if let Some(index) = existing_entry {
+                                kwargs[index] = ((*arg_name).into(), arg.clone());
+                            } else {
+                                kwargs.push(((*arg_name).into(), arg.clone()));
                             }
-                            return Ok(MessageBody(
-                                vec![],
-                                from_value::<T::Params>(Value::Map(kwargs))?,
-                                from_value::<MessageBodyEmbed>(Value::Map(embed))?,
-                            ));
+                        } else {
+                            break;
                         }
                     }
+                    return Ok(MessageBody(
+                        vec![],
+                        from_value::<T::Params>(Value::Map(kwargs))?,
+                        from_value::<MessageBodyEmbed>(Value::Map(embed))?,
+                    ));
                 }
                 Ok(from_value(value)?)
             }
@@ -575,7 +578,7 @@ pub trait TryDeserializeMessage {
 }
 
 /// Message meta data pertaining to the broker.
-#[derive(Eq, PartialEq, Debug, Clone)]
+#[derive(Default, Eq, PartialEq, Debug, Clone)]
 pub struct MessageProperties {
     /// A unique ID associated with the task, usually the same as [`MessageHeaders::id`].
     pub correlation_id: String,
@@ -596,7 +599,7 @@ pub struct MessageProperties {
 /// Additional message delivery information. This is a mapping containing the
 /// exchange and routing key used to deliver this task. Availability of keys in
 /// this dict depends on the message broker used.
-#[derive(Eq, PartialEq, Debug, Clone, Serialize)]
+#[derive(Default, Eq, PartialEq, Debug, Clone, Serialize)]
 pub struct DeliveryInfo {
     pub exchange: String,
     pub routing_key: String,

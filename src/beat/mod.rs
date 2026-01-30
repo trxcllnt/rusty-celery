@@ -22,7 +22,7 @@
 //! correspond to the different scheduler implementations in Python.
 
 use crate::broker::{
-    broker_builder_from_url, build_and_connect, configure_task_routes, BrokerBuilder,
+    BrokerBuilder, broker_builder_from_url, build_and_connect, configure_task_routes,
 };
 use crate::routing::{self, Rule};
 use crate::{

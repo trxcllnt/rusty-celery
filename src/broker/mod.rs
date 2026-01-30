@@ -37,7 +37,9 @@ pub trait Delivery: TryDeserializeMessage + Send + Sync + std::fmt::Debug {
 }
 
 /// The error type of an unsuccessful delivery.
-pub trait DeliveryError: std::fmt::Display + Send + Sync {}
+pub trait DeliveryError: std::fmt::Display + Send + Sync {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send + Sync>;
+}
 
 /// The stream type that the [`Celery`](crate::Celery) app will consume deliveries from.
 pub trait DeliveryStream:
@@ -83,7 +85,7 @@ pub trait Broker: Send + Sync {
     ) -> Result<(), BrokerError>;
 
     /// Send a [`Message`](protocol/struct.Message.html) into a queue.
-    async fn send(&self, message: &Message, queue: &str) -> Result<(), BrokerError>;
+    async fn send(&self, message: Message, queue: &str) -> Result<(), BrokerError>;
 
     /// Increase the `prefetch_count`. This has to be done when a task with a future
     /// ETA is consumed.
@@ -121,6 +123,9 @@ pub trait BrokerBuilder: Send + Sync {
 
     /// Declare a queue.
     fn declare_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder>;
+
+    /// Declare a broadcast queue.
+    fn declare_broadcast_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder>;
 
     /// Declare a exclusive queue.
     fn declare_exclusive_queue(self: Box<Self>, name: &str) -> Box<dyn BrokerBuilder>;

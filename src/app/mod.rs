@@ -9,18 +9,18 @@ use std::sync::Arc;
 use tokio::select;
 
 #[cfg(unix)]
-use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
-use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::{self, Duration};
 use tokio_stream::StreamMap;
 
 mod trace;
 
 use crate::broker::{
-    broker_builder_from_url, build_and_connect, configure_task_routes, Broker, BrokerBuilder,
-    Delivery,
+    Broker, BrokerBuilder, Delivery, broker_builder_from_url, build_and_connect,
+    configure_task_routes,
 };
 use crate::error::{BrokerError, CeleryError, TraceError};
 use crate::protocol::{Message, MessageContentType};
@@ -28,7 +28,7 @@ use crate::routing::Rule;
 use crate::task::{
     AsyncResult, Signature, Task, TaskEvent, TaskOptions, TaskOptionsConcreteDefault, TaskStatus,
 };
-use trace::{build_tracer, TraceBuilder, TracerTrait};
+use trace::{TraceBuilder, TracerTrait, build_tracer};
 
 struct Config {
     name: String,
@@ -212,6 +212,12 @@ impl CeleryBuilder {
         self
     }
 
+    /// Declare a broadcast queue. The default value depends on the broker implementation.
+    pub fn broker_declare_broadcast_queue(mut self, queue: &str) -> Self {
+        self.config.broker_builder = self.config.broker_builder.declare_broadcast_queue(queue);
+        self
+    }
+
     /// Declare a exclusive queue. The default value depends on the broker implementation.
     pub fn broker_declare_exclusive_queue(mut self, queue: &str) -> Self {
         self.config.broker_builder = self.config.broker_builder.declare_exclusive_queue(queue);
@@ -321,7 +327,7 @@ impl CeleryBuilder {
                 "Setting \"nacks_enabled = true\" without specifying \"acks_on_failure_or_timeout\" \
                 is invalid. \"acks_on_failure_or_timeout\" is enabled by default and has precedence over \
                 \"nacks_enabled\". To enable negative acknowledgements, you must explicitly set \
-                \"acks_on_failure_or_timeout = false\"."
+                \"acks_on_failure_or_timeout = false\".",
             )));
         }
 
@@ -443,14 +449,10 @@ impl Celery {
             .await
             .map_err(|e| CeleryError::IoError(e.into()))??;
 
-        info!(
-            "Sending task {}[{}] to {}",
-            T::NAME,
-            message.task_id(),
-            queue,
-        );
-        self.broker.send(&message, queue).await?;
-        Ok(AsyncResult::new(message.task_id()))
+        let task_id = message.task_id().to_string();
+        info!("Sending task {}[{}] to {}", T::NAME, task_id, queue);
+        self.broker.send(message, queue).await?;
+        Ok(AsyncResult::new(task_id))
     }
 
     /// Register a task.
@@ -634,7 +636,7 @@ impl Celery {
         event_tx: UnboundedSender<TaskEvent>,
     ) {
         if let Err(e) = self.try_handle_delivery(delivery, event_tx).await {
-            error!("{}", e);
+            error!("try_handle_delivery error: {e}");
         }
     }
 
@@ -807,22 +809,10 @@ impl Celery {
         // If that occurs we break from this loop and move to the warm shutdown loop
         // if there are still any pending tasks (tasks being executed, not including
         // tasks being delayed due to a future ETA).
+
         loop {
             select! {
-                maybe_delivery_result = stream_map.next() => {
-                    if let Some((queue, delivery_result)) = maybe_delivery_result {
-                        match delivery_result {
-                            Ok(delivery) => {
-                                let task_event_tx = task_event_tx.clone();
-                                debug!("Received delivery from {}: {:?}", queue, delivery);
-                                tokio::spawn(self.clone().handle_delivery(delivery, task_event_tx));
-                            }
-                            Err(e) => {
-                                error!("Deliver failed: {}", e);
-                            }
-                        }
-                    }
-                },
+                biased;
                 ending = ender.wait() => {
                     if let Ok(SigType::Interrupt) = ending {
                         warn!("Ope! Hitting Ctrl+C again will terminate all running tasks!");
@@ -830,24 +820,39 @@ impl Celery {
                     info!("Warm shutdown...");
                     break;
                 },
-                maybe_task_event = task_event_rx.recv() => {
-                    if let Some(event) = maybe_task_event {
-                        debug!("Received task event {:?}", event);
-                        match event {
-                            TaskEvent::StatusChange(TaskStatus::Pending) => pending_tasks += 1,
-                            TaskEvent::StatusChange(TaskStatus::Finished) => pending_tasks -= 1,
-                        };
+                Some((queue, delivery_result)) = stream_map.next() => {
+                    match delivery_result {
+                        Ok(delivery) => {
+                            let task_event_tx = task_event_tx.clone();
+                            debug!("Received delivery from {}: {:?}", queue, delivery);
+                            tokio::spawn(self.clone().handle_delivery(delivery, task_event_tx));
+                        }
+                        Err(e) => {
+                            match e.into_any().downcast::<BrokerError>() {
+                                Ok(broker_error) => {
+                                    error!("Delivery BrokerError: {broker_error}");
+                                    return Err((*broker_error).into());
+                                }
+                                Err(e) => {
+                                    error!("Deliver failed: {e:?}");
+                                }
+                            }
+                        }
                     }
                 },
-                maybe_broker_error = broker_error_rx.recv() => {
-                    if let Some(broker_error) = maybe_broker_error {
-                        error!("{}", broker_error);
-                        return Err(broker_error.into());
-                    }
+                Some(event) = task_event_rx.recv() => {
+                    debug!("Received task event {:?}", event);
+                    match event {
+                        TaskEvent::StatusChange(TaskStatus::Pending) => pending_tasks += 1,
+                        TaskEvent::StatusChange(TaskStatus::Finished) => pending_tasks -= 1,
+                    };
+                },
+                Some(broker_error) = broker_error_rx.recv() => {
+                    error!("BrokerError: {broker_error}");
+                    return Err(broker_error.into());
                 }
                 // This branch ensures the loop continues and re-polls the stream_map
-                _ = time::sleep(Duration::from_millis(1000)) => {
-                },
+                else => time::sleep(Duration::from_millis(1)).await,
             };
         }
 
@@ -856,6 +861,8 @@ impl Celery {
             debug!("Cancelling consumer {}", consumer_tag);
             self.broker.cancel(&consumer_tag).await?;
         }
+
+        drop(stream_map);
 
         if pending_tasks > 0 {
             // Warm shutdown loop. When there are still pending tasks we wait for them

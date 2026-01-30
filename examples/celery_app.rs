@@ -18,9 +18,9 @@ fn add(x: i32, y: i32) -> TaskResult<i32> {
 async fn buggy_task() -> TaskResult<()> {
     let data = tokio::fs::read("this-file-doesn't-exist")
         .await
-        .with_unexpected_err(|| {
-            "This error is part of the example, it is used to showcase error handling"
-        })?;
+        .with_unexpected_err(
+            || "This error is part of the example, it is used to showcase error handling",
+        )?;
     println!("Read {} bytes", data.len());
     Ok(())
 }
@@ -41,6 +41,13 @@ fn bound_task(task: &Self) {
     println!("{:?}", task.request.hostname);
 }
 
+// Demonstrates a task that is bound to the task instance, i.e. runs as an instance method.
+#[celery::task]
+fn broadcast_task(msg: String) {
+    // Print some info about the request for debugging.
+    println!("msg received: {msg:?}");
+}
+
 #[derive(Debug, StructOpt)]
 #[structopt(
     name = "celery_app",
@@ -50,7 +57,7 @@ fn bound_task(task: &Self) {
 enum CeleryOpt {
     Consume,
     Produce {
-        #[structopt(possible_values = &["add", "buggy_task", "bound_task", "long_running_task"])]
+        #[structopt(possible_values = &["add", "buggy_task", "bound_task", "broadcast_task", "long_running_task"])]
         tasks: Vec<String>,
     },
 }
@@ -62,28 +69,33 @@ async fn main() -> Result<()> {
     let opt = CeleryOpt::from_args();
 
     let my_app = celery::app!(
-        // broker = RedisBroker { std::env::var("REDIS_ADDR").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into()) },
-        broker = AMQPBroker { std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1:5672".into()) },
+        broker = RedisBroker { std::env::var("REDIS_ADDR").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into()) },
+        // broker = AMQPBroker { std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1:5672".into()) },
         tasks = [
             add,
             buggy_task,
             long_running_task,
             bound_task,
+            broadcast_task,
         ],
         // This just shows how we can route certain tasks to certain queues based
         // on glob matching.
         task_routes = [
             "buggy_task" => "buggy-queue",
+            "broadcast_task" => "broadcast-queue",
             "*" => "celery",
         ],
         prefetch_count = 2,
         heartbeat = Some(10),
+        broker_declare_broadcast_queue = "broadcast-queue",
     ).await?;
 
     match opt {
         CeleryOpt::Consume => {
             my_app.display_pretty().await;
-            my_app.consume_from(&["celery", "buggy-queue"]).await?;
+            my_app
+                .consume_from(&["celery", "buggy-queue", "broadcast-queue"])
+                .await?;
         }
         CeleryOpt::Produce { tasks } => {
             if tasks.is_empty() {
@@ -96,6 +108,11 @@ async fn main() -> Result<()> {
 
                 // Send the buggy task that will fail and be retried a few times.
                 my_app.send_task(buggy_task::new()).await?;
+
+                // Broadcast the same message to multiple consumers.
+                my_app
+                    .send_task(broadcast_task::new("hello!".into()))
+                    .await?;
 
                 // Send the long running task that will fail with a timeout error.
                 my_app
@@ -113,6 +130,11 @@ async fn main() -> Result<()> {
                         "add" => my_app.send_task(add::new(1, 2)).await?,
                         "bound_task" => my_app.send_task(bound_task::new()).await?,
                         "buggy_task" => my_app.send_task(buggy_task::new()).await?,
+                        "broadcast_task" => {
+                            my_app
+                                .send_task(broadcast_task::new("hello!".into()))
+                                .await?
+                        }
                         "long_running_task" => {
                             my_app.send_task(long_running_task::new(Some(3))).await?
                         }
