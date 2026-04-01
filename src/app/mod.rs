@@ -827,7 +827,7 @@ impl Celery {
                     match delivery_result {
                         Ok(delivery) => {
                             let task_event_tx = task_event_tx.clone();
-                            debug!("Received delivery from {}: {:?}", queue, delivery);
+                            debug!("Received delivery from {queue}: {delivery:?}");
                             tokio::spawn(self.clone().handle_delivery(delivery, task_event_tx));
                         }
                         Err(e) => {
@@ -844,7 +844,7 @@ impl Celery {
                     }
                 },
                 Some(event) = task_event_rx.recv() => {
-                    debug!("Received task event {:?}", event);
+                    debug!("Received task event {event:?}");
                     match event {
                         TaskEvent::StatusChange(TaskStatus::Pending) => pending_tasks += 1,
                         TaskEvent::StatusChange(TaskStatus::Finished) => pending_tasks -= 1,
@@ -859,19 +859,23 @@ impl Celery {
             };
         }
 
+        // Drop stream_map so we stop polling the consumer streams.
+        // This ensures we don't accept more tasks while the broker
+        // is cancelling the current ones.
+        drop(stream_map);
+
         // Cancel consumers.
+        info!("Closing consumers...");
         for consumer_tag in consumer_tags {
-            debug!("Cancelling consumer {}", consumer_tag);
+            debug!("Cancelling consumer {consumer_tag}");
             self.broker.cancel(&consumer_tag).await?;
         }
-
-        drop(stream_map);
 
         if pending_tasks > 0 {
             // Warm shutdown loop. When there are still pending tasks we wait for them
             // to finish. We get updates about pending tasks through the `task_event_rx` channel.
             // We also watch for a second SIGINT or SIGTERM, in which case we immediately shutdown.
-            info!("Waiting on {} pending tasks...", pending_tasks);
+            info!("Waiting on {pending_tasks} pending tasks...");
             loop {
                 select! {
                     ending = ender.wait() => {
@@ -882,13 +886,14 @@ impl Celery {
                     },
                     maybe_event = task_event_rx.recv() => {
                         if let Some(event) = maybe_event {
-                            debug!("Received task event {:?}", event);
+                            debug!("Received task event {event:?}");
                             match event {
                                 TaskEvent::StatusChange(TaskStatus::Pending) => pending_tasks += 1,
                                 TaskEvent::StatusChange(TaskStatus::Finished) => pending_tasks -= 1,
                             };
                             if pending_tasks <= 0 {
-                                break;
+                                info!("No more pending tasks. See ya!");
+                                return Ok(());
                             }
                         }
                     },
@@ -896,7 +901,7 @@ impl Celery {
             }
         }
 
-        info!("No more pending tasks. See ya!");
+        info!("See ya!");
 
         Ok(())
     }
