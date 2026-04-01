@@ -33,6 +33,8 @@ use uuid::Uuid;
 #[cfg(test)]
 use std::any::Any;
 
+static GROUP: &str = "_celery";
+
 struct Consumer {
     conn: ConnectionManager,
     consumer: Option<Arc<str>>,
@@ -82,7 +84,7 @@ impl super::Delivery for Delivery {
         let id = self.item.id.as_str();
         let key = self.item.key.as_ref();
         if self.consumer.is_some() {
-            conn.xack(key, "_celery", &[id]).await?;
+            conn.xack(key, GROUP, &[id]).await?;
         }
         conn.xdel(key, &[id]).await?;
         Ok(())
@@ -464,7 +466,7 @@ async fn declare_queues(
     let cooperative = Arc::new(RedisStreamsBatchReader::cooperative(
         queues.iter().filter(|(_, c)| !c.broadcast).count(),
         RedisBroker::connect(url, connection_timeout).await?,
-        "_celery",
+        GROUP,
         consumer,
     ));
 
@@ -475,7 +477,7 @@ async fn declare_queues(
                 if config.broadcast {
                     BroadcastQueue::new(broadcast.clone(), queue).await?
                 } else {
-                    CooperativeQueue::new(cooperative.clone(), queue, "_celery", consumer).await?
+                    CooperativeQueue::new(cooperative.clone(), queue, GROUP, consumer).await?
                 },
             ))
         })
