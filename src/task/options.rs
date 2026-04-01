@@ -163,11 +163,6 @@ impl TaskOptions {
         self.nacks_enabled = self.nacks_enabled.or(other.nacks_enabled);
         self.content_type = self.content_type.or(other.content_type);
     }
-
-    /// Override the fields in `other` with the fields in `self`.
-    pub(crate) fn override_other(&self, other: &mut TaskOptions) {
-        other.update(self);
-    }
 }
 
 /// This struct aims for centralizing the concrete default values.
