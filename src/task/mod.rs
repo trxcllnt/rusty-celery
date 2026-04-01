@@ -165,19 +165,17 @@ pub trait Task: Send + Sync + std::marker::Sized {
     }
 
     fn retry_for_unexpected(&self) -> bool {
-        Self::DEFAULTS
+        self.options()
             .retry_for_unexpected
-            .or(self.options().retry_for_unexpected)
-            .unwrap_or(true)
+            .unwrap_or_else(TaskOptionsConcreteDefault::retry_for_unexpected)
     }
 
     fn time_limit(&self) -> Option<u32> {
         self.request().time_limit.or_else(|| {
-            // Take min or `time_limit` and `hard_time_limit`.
-            let time_limit = Self::DEFAULTS.time_limit.or(self.options().time_limit);
-            let hard_time_limit = Self::DEFAULTS
-                .hard_time_limit
-                .or(self.options().hard_time_limit);
+            // Take min of `time_limit` and `hard_time_limit`.
+            let options = self.options();
+            let time_limit = options.time_limit;
+            let hard_time_limit = options.hard_time_limit;
             match (time_limit, hard_time_limit) {
                 (Some(t1), Some(t2)) => Some(std::cmp::min(t1, t2)),
                 (Some(t1), None) => Some(t1),
@@ -188,41 +186,36 @@ pub trait Task: Send + Sync + std::marker::Sized {
     }
 
     fn max_retries(&self) -> Option<u32> {
-        Self::DEFAULTS.max_retries.or(self.options().max_retries)
+        self.options().max_retries
     }
 
     fn min_retry_delay(&self) -> u32 {
-        Self::DEFAULTS
+        self.options()
             .min_retry_delay
-            .or(self.options().min_retry_delay)
             .unwrap_or_else(TaskOptionsConcreteDefault::min_retry_delay)
     }
 
     fn max_retry_delay(&self) -> u32 {
-        Self::DEFAULTS
+        self.options()
             .max_retry_delay
-            .or(self.options().max_retry_delay)
             .unwrap_or_else(TaskOptionsConcreteDefault::max_retry_delay)
     }
 
     fn acks_late(&self) -> bool {
-        Self::DEFAULTS
+        self.options()
             .acks_late
-            .or(self.options().acks_late)
             .unwrap_or_else(TaskOptionsConcreteDefault::acks_late)
     }
 
     fn acks_on_failure_or_timeout(&self) -> bool {
-        Self::DEFAULTS
+        self.options()
             .acks_on_failure_or_timeout
-            .or(self.options().acks_on_failure_or_timeout)
             .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout)
     }
 
     fn nacks_enabled(&self) -> bool {
-        Self::DEFAULTS
+        self.options()
             .nacks_enabled
-            .or(self.options().nacks_enabled)
             .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled)
     }
 }

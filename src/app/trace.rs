@@ -266,7 +266,7 @@ pub(super) type TraceBuilder = Box<
 pub(super) fn build_tracer<T: Task + Send + 'static>(
     app: Arc<Celery>,
     message: Message,
-    mut options: TaskOptions,
+    task_options: TaskOptions,
     event_tx: UnboundedSender<TaskEvent>,
     hostname: String,
 ) -> TraceBuilderResult {
@@ -274,8 +274,9 @@ pub(super) fn build_tracer<T: Task + Send + 'static>(
     let mut request = Request::<T>::try_from_message(app, message)?;
     request.hostname = Some(hostname);
 
-    // Override app-level options with task-level options.
-    T::DEFAULTS.override_other(&mut options);
+    // Prefer task-level options over app-level options.
+    let mut options = T::DEFAULTS;
+    options.update(&task_options);
 
     // Now construct the task from the request and options.
     // It seems redundant to construct a request just to use it to construct a task,

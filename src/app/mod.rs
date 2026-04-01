@@ -497,6 +497,16 @@ impl Celery {
         delivery: Box<dyn Delivery>,
         event_tx: UnboundedSender<TaskEvent>,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        // Use the app's preferred (n)ack mode before we've deserialized the message
+        let acks_on_failure_or_timeout = self
+            .task_options
+            .acks_on_failure_or_timeout
+            .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout);
+        let nacks_enabled = self
+            .task_options
+            .nacks_enabled
+            .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled);
+
         // Coerce the delivery into a protocol message.
         let message = match delivery.try_deserialize_message() {
             Ok(message) => message,
@@ -505,12 +515,8 @@ impl Celery {
                 // the broker so it gets deleted.
                 self.notify_message_process_failed(
                     delivery.as_ref(),
-                    self.task_options
-                        .acks_on_failure_or_timeout
-                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
-                    self.task_options
-                        .nacks_enabled
-                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
+                    acks_on_failure_or_timeout,
+                    nacks_enabled,
                 )
                 .await?;
 
@@ -529,18 +535,18 @@ impl Celery {
                 // to delete it and return an error.
                 self.notify_message_process_failed(
                     delivery.as_ref(),
-                    self.task_options
-                        .acks_on_failure_or_timeout
-                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
-                    self.task_options
-                        .nacks_enabled
-                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
+                    acks_on_failure_or_timeout,
+                    nacks_enabled,
                 )
                 .await?;
 
                 return Err(e);
             }
         };
+
+        // Now switch to using the task's preferred (n)ack modes
+        let acks_on_failure_or_timeout = tracer.acks_on_failure_or_timeout();
+        let nacks_enabled = tracer.nacks_enabled();
 
         if tracer.is_delayed() {
             // Task has an ETA, so we need to increment the prefetch count so that
@@ -554,19 +560,15 @@ impl Celery {
                 self.retry_delivery_if_needed(
                     delivery.as_ref(),
                     None,
-                    tracer.acks_on_failure_or_timeout(),
-                    tracer.nacks_enabled(),
+                    acks_on_failure_or_timeout,
+                    nacks_enabled,
                 )
                 .await?;
 
                 self.notify_message_process_failed(
                     delivery.as_ref(),
-                    self.task_options
-                        .acks_on_failure_or_timeout
-                        .unwrap_or_else(TaskOptionsConcreteDefault::acks_on_failure_or_timeout),
-                    self.task_options
-                        .nacks_enabled
-                        .unwrap_or_else(TaskOptionsConcreteDefault::nacks_enabled),
+                    acks_on_failure_or_timeout,
+                    nacks_enabled,
                 )
                 .await?;
 
@@ -581,6 +583,7 @@ impl Celery {
         if !tracer.acks_late() {
             self.notify_message_processed_successfully(delivery.as_ref())
                 .await?;
+            // Notify the broker that the message was processed
             self.broker.on_message_processed(delivery.as_ref()).await?;
         }
 
@@ -594,8 +597,8 @@ impl Celery {
             self.retry_delivery_if_needed(
                 delivery.as_ref(),
                 retry_eta,
-                tracer.acks_on_failure_or_timeout(),
-                tracer.nacks_enabled(),
+                acks_on_failure_or_timeout,
+                nacks_enabled,
             )
             .await?;
         }
@@ -608,8 +611,8 @@ impl Celery {
             } else {
                 self.notify_message_process_failed(
                     delivery.as_ref(),
-                    tracer.acks_on_failure_or_timeout(),
-                    tracer.nacks_enabled(),
+                    acks_on_failure_or_timeout,
+                    nacks_enabled,
                 )
                 .await?;
             }
