@@ -34,7 +34,7 @@ type Ordinal = u32;
 /// celery::beat::CronSchedule::from_string("* 8-17 1 * sun");
 ///
 /// // Execute every minute in march with a custom time zone:
-/// let time_zone = chrono::offset::FixedOffset::east(3600);
+/// let time_zone = chrono::offset::FixedOffset::east_opt(3600).unwrap();
 /// celery::beat::CronSchedule::from_string_with_time_zone("* * * mar *", time_zone);
 /// ```
 ///

@@ -55,4 +55,3 @@ build-docs :
 check-minimal-versions :
 	rm -f Cargo.lock
 	cargo +nightly build -Z minimal-versions --tests
-
