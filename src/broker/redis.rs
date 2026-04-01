@@ -112,40 +112,28 @@ impl Stream for Consumer {
                 let prefetch_count = self.prefetch_count.load(Ordering::SeqCst);
                 let inner = self.inner.take();
                 if pending_tasks >= prefetch_count {
-                    log::debug!("Pending tasks limit reached");
-                    result = Poll::Pending;
-                    None
-                } else {
-                    if let Some(mut inner) = inner.or_else(|| self.queue.subscribe()) {
-                        match inner.poll_next(cx) {
-                            Poll::Pending => {
-                                self.inner = Some(inner);
-                                result = Poll::Pending;
-                                None
-                            }
-                            Poll::Ready(None) => {
-                                result = Poll::Pending;
-                                None
-                            }
-                            Poll::Ready(Some(Err(err))) => {
-                                result = Poll::Ready(Some(Err(Box::new(err))));
-                                None
-                            }
-                            Poll::Ready(Some(Ok(item))) => {
-                                self.inner = Some(inner);
-                                result = Poll::Ready(Some(Ok(Box::new(Delivery {
-                                    conn: self.conn.clone(),
-                                    consumer: self.consumer.clone(),
-                                    item,
-                                }))));
-                                Some(pending_tasks + 1)
-                            }
+                    log::trace!("Pending tasks limit reached");
+                } else if let Some(mut inner) = inner.or_else(|| self.queue.subscribe()) {
+                    match inner.poll_next(cx) {
+                        Poll::Ready(None) => {}
+                        Poll::Pending => {
+                            self.inner = Some(inner);
                         }
-                    } else {
-                        result = Poll::Pending;
-                        None
+                        Poll::Ready(Some(Err(err))) => {
+                            result = Poll::Ready(Some(Err(Box::new(err))));
+                        }
+                        Poll::Ready(Some(Ok(item))) => {
+                            self.inner = Some(inner);
+                            result = Poll::Ready(Some(Ok(Box::new(Delivery {
+                                conn: self.conn.clone(),
+                                consumer: self.consumer.clone(),
+                                item,
+                            }))));
+                            return Some(pending_tasks + 1);
+                        }
                     }
                 }
+                None
             },
         );
 
