@@ -3,21 +3,24 @@
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::{Stream, TryStreamExt};
-use lapin::message::Delivery;
-use lapin::options::{
-    BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicNackOptions,
-    BasicPublishOptions, BasicQosOptions, ExchangeDeclareOptions, QueueDeclareOptions,
-};
-use lapin::types::{AMQPValue, FieldArray, FieldTable};
-use lapin::uri::{self, AMQPUri};
-use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind, Queue};
-use log::debug;
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::task::Poll;
-use tokio::sync::{Mutex, RwLock};
 
-use super::{Broker, BrokerBuilder, DeliveryError, DeliveryStream};
+use lapin::{
+    options::{
+        BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicNackOptions,
+        BasicPublishOptions, ExchangeDeclareOptions, QueueDeclareOptions,
+    },
+    types::{AMQPValue, FieldArray, FieldTable},
+    uri::{self, AMQPUri},
+    {BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind, Queue},
+};
+
+use log::debug;
+
+use std::{collections::HashMap, pin::Pin, str::FromStr, sync::Arc};
+
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+
+use super::{Broker, BrokerBuilder, DeliveryError, DeliveryStream, IncrementHandle};
 use crate::error::{BrokerError, ProtocolError};
 use crate::protocol::{Message, MessageHeaders, MessageProperties, TryDeserializeMessage};
 use tokio_executor_trait::Tokio as TokioExecutor;
@@ -25,13 +28,46 @@ use tokio_executor_trait::Tokio as TokioExecutor;
 #[cfg(test)]
 use std::any::Any;
 
+type ConsumerStream = dyn Stream<Item = Result<Delivery, Box<dyn DeliveryError>>>;
+
 struct Consumer {
-    wrapped: lapin::Consumer,
+    inner: Pin<Box<ConsumerStream>>,
 }
 impl DeliveryStream for Consumer {}
+
 impl DeliveryError for lapin::Error {
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send + Sync> {
         self
+    }
+}
+
+impl From<lapin::Error> for Box<dyn DeliveryError> {
+    fn from(err: lapin::Error) -> Self {
+        Box::new(err)
+    }
+}
+
+struct Delivery {
+    item: lapin::message::Delivery,
+    #[allow(dead_code)]
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl std::fmt::Debug for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.item.fmt(f)
+    }
+}
+
+impl std::fmt::Display for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "exchange: {exchange}, queue: {queue}, id: {id}",
+            exchange = self.item.exchange,
+            queue = self.item.routing_key,
+            id = self.item.delivery_tag
+        )
     }
 }
 
@@ -46,17 +82,17 @@ impl super::Delivery for Delivery {
         message.headers.eta = eta;
         // Increment the number of retries.
         message.headers.retries = Some(message.headers.retries.map_or(1, |retry| retry + 1));
-        broker.send(message, self.routing_key.as_str()).await
+        broker.send(message, self.item.routing_key.as_str()).await
     }
     async fn remove(&self) -> Result<(), BrokerError> {
         todo!()
     }
     async fn ack(&self) -> Result<(), BrokerError> {
-        lapin::acker::Acker::ack(self, BasicAckOptions::default()).await?;
+        lapin::acker::Acker::ack(&self.item, BasicAckOptions::default()).await?;
         Ok(())
     }
     async fn nack(&self) -> Result<(), BrokerError> {
-        lapin::acker::Acker::nack(self, BasicNackOptions::default()).await?;
+        lapin::acker::Acker::nack(&self.item, BasicNackOptions::default()).await?;
         Ok(())
     }
 }
@@ -69,18 +105,14 @@ impl Stream for Consumer {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::option::Option<<Self as futures::Stream>::Item>> {
         use futures_lite::stream::StreamExt;
-
-        if let Poll::Ready(ret) = self.wrapped.poll_next(cx) {
-            if let Some(result) = ret {
-                match result {
-                    Ok(x) => Poll::Ready(Some(Ok(Box::new(x)))),
-                    Err(x) => Poll::Ready(Some(Err(Box::new(x)))),
-                }
-            } else {
-                Poll::Ready(None)
+        use std::task::Poll;
+        match self.inner.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(Some(Ok(item))) => {
+                Poll::Ready(Some(Ok(Box::new(item) as Box<dyn super::Delivery>)))
             }
-        } else {
-            Poll::Pending
         }
     }
 }
@@ -295,23 +327,23 @@ impl BrokerBuilder for AMQPBrokerBuilder {
 
         let conn = Connection::connect_uri(uri.clone(), create_connection_properties()).await?;
 
+        let prefetch_count = self.config.prefetch_count.clamp(1, u16::MAX);
+        debug!("Setting global prefetch limit to {prefetch_count}");
+        let pending_tasks = Arc::new(Semaphore::new(prefetch_count as usize));
+
         let consume_channel = conn.create_channel().await?;
         let produce_channel = conn.create_channel().await?;
         let queues = declare_queues(&consume_channel, &self.config.queues).await?;
 
-        let broker = AMQPBroker {
+        Ok(Box::new(AMQPBroker {
             uri,
             conn: Mutex::new(conn),
             consume_channel: RwLock::new(consume_channel),
             produce_channel: RwLock::new(produce_channel),
+            pending_tasks,
             queues: RwLock::new(queues),
             queue_declare_options: self.config.queues.clone(),
-            prefetch_count: Mutex::new(self.config.prefetch_count),
-        };
-        broker
-            .set_prefetch_count(self.config.prefetch_count)
-            .await?;
-        Ok(Box::new(broker))
+        }))
     }
 }
 
@@ -335,26 +367,15 @@ pub struct AMQPBroker {
     /// Mapping of queue name to Queue struct.
     ///
     /// This is only wrapped in RwLock for interior mutability.
-    queues: RwLock<HashMap<String, Box<dyn AMQPQueue>>>,
+    queues: RwLock<HashMap<String, Arc<dyn AMQPQueue>>>,
 
     queue_declare_options: HashMap<String, QueueConfig>,
 
-    /// Need to keep track of prefetch count. We put this behind a mutex to get interior
-    /// mutability.
-    prefetch_count: Mutex<u16>,
+    /// Keep track of and enforce global prefetch count.
+    pending_tasks: Arc<Semaphore>,
 }
 
-impl AMQPBroker {
-    async fn set_prefetch_count(&self, prefetch_count: u16) -> Result<(), BrokerError> {
-        debug!("Setting prefetch count to {}", prefetch_count);
-        self.consume_channel
-            .read()
-            .await
-            .basic_qos(prefetch_count, BasicQosOptions { global: false })
-            .await?;
-        Ok(())
-    }
-}
+impl AMQPBroker {}
 
 #[async_trait]
 impl Broker for AMQPBroker {
@@ -371,24 +392,56 @@ impl Broker for AMQPBroker {
             .lock()
             .await
             .on_error(move |e| error_handler(BrokerError::from(e)));
-        let queues = self.queues.read().await;
-        let queue = queues
+
+        let queue = self
+            .queues
+            .read()
+            .await
             .get(queue)
-            .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?;
-        let consumer = Consumer {
-            wrapped: self
-                .consume_channel
-                .read()
-                .await
-                .basic_consume(
-                    queue.name(),
-                    "",
-                    BasicConsumeOptions::default(),
-                    FieldTable::default(),
-                )
-                .await?,
-        };
-        Ok((consumer.wrapped.tag().to_string(), Box::new(consumer)))
+            .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?
+            .clone();
+
+        let consumer = self
+            .consume_channel
+            .read()
+            .await
+            .basic_consume(
+                queue.name(),
+                "",
+                BasicConsumeOptions::default(),
+                FieldTable::default(),
+            )
+            .await?;
+
+        let consumer_tag = consumer.tag().to_string();
+        let pending_tasks = self.pending_tasks.clone();
+
+        let consumer = Box::new(Consumer {
+            inner: Box::pin(async_stream::stream! {
+                for await item in consumer {
+                    let item = match item {
+                        Ok(item) => item,
+                        Err(err) => {
+                            yield Err(err.into());
+                            continue;
+                        }
+                    };
+
+                    let delivery = Delivery {
+                        item,
+                        permit: pending_tasks.clone().acquire_owned().await.ok()
+                    };
+
+                    if delivery.permit.is_some() {
+                        yield Ok(delivery);
+                    } else {
+                        yield Err(BrokerError::Retry(Box::new(delivery)).into());
+                    }
+                }
+            }),
+        });
+
+        Ok((consumer_tag, consumer))
     }
 
     async fn cancel(&self, consumer_tag: &str) -> Result<(), BrokerError> {
@@ -418,45 +471,26 @@ impl Broker for AMQPBroker {
 
     async fn send(&self, message: Message, queue: &str) -> Result<(), BrokerError> {
         let produce_channel = self.produce_channel.read().await;
-        self.queues
-            .read()
-            .await
-            .get(queue)
-            .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?
-            .send(&produce_channel, message)
-            .await
-    }
-
-    async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
-        let new_count = {
-            let mut prefetch_count = self.prefetch_count.lock().await;
-            if *prefetch_count < u16::MAX {
-                let new_count = *prefetch_count + 1;
-                *prefetch_count = new_count;
-                new_count
-            } else {
-                u16::MAX
-            }
-        };
-        self.set_prefetch_count(new_count).await?;
-        Ok(())
-    }
-
-    async fn decrease_prefetch_count(&self) -> Result<(), BrokerError> {
-        let new_count = {
-            let mut prefetch_count = self.prefetch_count.lock().await;
-            if *prefetch_count > 1 {
-                let new_count = *prefetch_count - 1;
-                *prefetch_count = new_count;
-                new_count
-            } else {
-                0u16
-            }
-        };
-        if new_count > 0 {
-            self.set_prefetch_count(new_count).await?;
+        if let Some(queue) = self.queues.read().await.get(queue) {
+            queue.send(&produce_channel, message).await?;
+        } else {
+            let properties = message.delivery_properties();
+            debug!("Sending AMQP message with: {properties:?}");
+            produce_channel
+                .basic_publish(
+                    "",
+                    queue,
+                    BasicPublishOptions::default(),
+                    &message.raw_body[..],
+                    properties,
+                )
+                .await?;
         }
         Ok(())
+    }
+
+    async fn increase_prefetch_count(&self) -> Result<IncrementHandle, BrokerError> {
+        Ok(IncrementHandle::new(self.pending_tasks.clone()))
     }
 
     async fn close(&self) -> Result<(), BrokerError> {
@@ -512,15 +546,15 @@ impl Broker for AMQPBroker {
 async fn declare_queues(
     consume_channel: &Channel,
     queues: &HashMap<String, QueueConfig>,
-) -> Result<HashMap<String, Box<dyn AMQPQueue>>, BrokerError> {
+) -> Result<HashMap<String, Arc<dyn AMQPQueue>>, BrokerError> {
     futures::stream::iter(queues.iter().map(Ok))
-        .and_then(|(queue, config)| async move {
+        .and_then(|(queue, config)| async {
             Ok((
                 queue.clone(),
                 if config.broadcast {
-                    BroadcastQueue::new_boxed(consume_channel, queue, config).await?
+                    BroadcastQueue::new(consume_channel, queue, config).await?
                 } else {
-                    CooperativeQueue::new_boxed(consume_channel, queue, config).await?
+                    CooperativeQueue::new(consume_channel, queue, config).await?
                 },
             ))
         })
@@ -558,12 +592,13 @@ struct CooperativeQueue {
 }
 
 impl CooperativeQueue {
-    async fn new_boxed(
+    #[allow(clippy::new_ret_no_self)]
+    async fn new(
         consume_channel: &Channel,
         queue: &str,
         config: &QueueConfig,
-    ) -> Result<Box<dyn AMQPQueue>, BrokerError> {
-        Ok(Box::new(Self {
+    ) -> Result<Arc<dyn AMQPQueue>, BrokerError> {
+        Ok(Arc::new(Self {
             inner: consume_channel
                 .queue_declare(queue, config.into(), config.into())
                 .await?,
@@ -585,7 +620,7 @@ impl AMQPQueue for CooperativeQueue {
                 "",
                 self.name(),
                 BasicPublishOptions::default(),
-                &message.raw_body.clone()[..],
+                &message.raw_body[..],
                 properties,
             )
             .await?;
@@ -599,11 +634,12 @@ struct BroadcastQueue {
 }
 
 impl BroadcastQueue {
-    async fn new_boxed(
+    #[allow(clippy::new_ret_no_self)]
+    async fn new(
         consume_channel: &Channel,
         queue: &str,
         config: &QueueConfig,
-    ) -> Result<Box<dyn AMQPQueue>, BrokerError> {
+    ) -> Result<Arc<dyn AMQPQueue>, BrokerError> {
         // Declare the fanout exchange
         consume_channel
             .exchange_declare(
@@ -637,7 +673,7 @@ impl BroadcastQueue {
             )
             .await?;
 
-        Ok(Box::new(Self {
+        Ok(Arc::new(Self {
             inner,
             queue: queue.to_owned(),
         }))
@@ -661,7 +697,7 @@ impl AMQPQueue for BroadcastQueue {
                 self.queue.as_str(),
                 "",
                 BasicPublishOptions::default(),
-                &message.raw_body.clone()[..],
+                &message.raw_body[..],
                 properties,
             )
             .await?;
@@ -779,6 +815,7 @@ impl TryDeserializeMessage for (Channel, Delivery) {
 impl TryDeserializeMessage for Delivery {
     fn try_deserialize_message(&self) -> Result<Message, ProtocolError> {
         let headers = self
+            .item
             .properties
             .headers()
             .as_ref()
@@ -786,6 +823,7 @@ impl TryDeserializeMessage for Delivery {
         Ok(Message {
             properties: MessageProperties {
                 correlation_id: self
+                    .item
                     .properties
                     .correlation_id()
                     .as_ref()
@@ -794,12 +832,14 @@ impl TryDeserializeMessage for Delivery {
                         ProtocolError::MissingRequiredProperty("correlation_id".into())
                     })?,
                 content_type: self
+                    .item
                     .properties
                     .content_type()
                     .as_ref()
                     .map(|v| v.to_string())
                     .ok_or_else(|| ProtocolError::MissingRequiredProperty("content_type".into()))?,
                 content_encoding: self
+                    .item
                     .properties
                     .content_encoding()
                     .as_ref()
@@ -807,7 +847,12 @@ impl TryDeserializeMessage for Delivery {
                     .ok_or_else(|| {
                         ProtocolError::MissingRequiredProperty("content_encoding".into())
                     })?,
-                reply_to: self.properties.reply_to().as_ref().map(|v| v.to_string()),
+                reply_to: self
+                    .item
+                    .properties
+                    .reply_to()
+                    .as_ref()
+                    .map(|v| v.to_string()),
                 delivery_info: None,
             },
             headers: MessageHeaders {
@@ -843,7 +888,7 @@ impl TryDeserializeMessage for Delivery {
                 kwargsrepr: get_header_str(headers, "kwargsrepr"),
                 origin: get_header_str(headers, "origin"),
             },
-            raw_body: self.data.clone(),
+            raw_body: self.item.data.clone(),
         })
     }
 }
@@ -933,13 +978,16 @@ mod tests {
         };
 
         let delivery = Delivery {
-            delivery_tag: 0,
-            exchange: ShortString::from(""),
-            routing_key: ShortString::from("celery"),
-            redelivered: false,
-            properties: message.delivery_properties(),
-            data: vec![],
-            acker: Default::default(),
+            item: lapin::message::Delivery {
+                delivery_tag: 0,
+                exchange: ShortString::from(""),
+                routing_key: ShortString::from("celery"),
+                redelivered: false,
+                properties: message.delivery_properties(),
+                data: vec![],
+                acker: Default::default(),
+            },
+            permit: None,
         };
 
         let message2 = delivery.try_deserialize_message();

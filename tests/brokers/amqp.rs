@@ -73,6 +73,7 @@ async fn test_amqp_broker() {
             "backend.*" => "backend",
             "ml.*" => "ml"
         ],
+        prefetch_count = 2
     ).await.unwrap();
     println!("Initialized broker");
     // Send task to queue.

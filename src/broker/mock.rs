@@ -1,6 +1,6 @@
 //! Defines mock broker that can be used to test other components that rely on a broker.
 
-use super::{Broker, BrokerBuilder, Delivery, DeliveryStream};
+use super::{Broker, BrokerBuilder, Delivery, DeliveryStream, IncrementHandle};
 use crate::error::{BrokerError, ProtocolError};
 use crate::protocol::{Message, TryDeserializeMessage};
 use async_trait::async_trait;
@@ -9,9 +9,8 @@ use futures::{
     Stream,
     task::{Context, Poll},
 };
-use std::collections::HashMap;
-use std::time::SystemTime;
-use tokio::sync::RwLock;
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use tokio::sync::{RwLock, Semaphore};
 
 #[cfg(test)]
 use std::any::Any;
@@ -149,12 +148,8 @@ impl Broker for MockBroker {
         Ok(())
     }
 
-    async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
-        Ok(())
-    }
-
-    async fn decrease_prefetch_count(&self) -> Result<(), BrokerError> {
-        Ok(())
+    async fn increase_prefetch_count(&self) -> Result<IncrementHandle, BrokerError> {
+        Ok(IncrementHandle::new(Arc::new(Semaphore::new(0))))
     }
 
     async fn close(&self) -> Result<(), BrokerError> {

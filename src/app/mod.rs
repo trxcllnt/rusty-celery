@@ -494,7 +494,7 @@ impl Celery {
     /// and communicating with the broker.
     async fn try_handle_delivery(
         self: &Arc<Self>,
-        delivery: Box<dyn Delivery>,
+        delivery: &dyn Delivery,
         event_tx: UnboundedSender<TaskEvent>,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         // Use the app's preferred (n)ack mode before we've deserialized the message
@@ -514,12 +514,11 @@ impl Celery {
                 // This is a naughty message that we can't handle, so we'll ack it with
                 // the broker so it gets deleted.
                 self.notify_message_process_failed(
-                    delivery.as_ref(),
+                    delivery,
                     acks_on_failure_or_timeout,
                     nacks_enabled,
                 )
                 .await?;
-
                 return Err(Box::new(e) as Box<dyn Error + Send + Sync + 'static>);
             }
         };
@@ -534,12 +533,11 @@ impl Celery {
                 // the body of the message for some reason, so ack it with the broker
                 // to delete it and return an error.
                 self.notify_message_process_failed(
-                    delivery.as_ref(),
+                    delivery,
                     acks_on_failure_or_timeout,
                     nacks_enabled,
                 )
                 .await?;
-
                 return Err(e);
             }
         };
@@ -548,43 +546,51 @@ impl Celery {
         let acks_on_failure_or_timeout = tracer.acks_on_failure_or_timeout();
         let nacks_enabled = tracer.nacks_enabled();
 
-        if tracer.is_delayed() {
+        // If we increase the prefetch count due to a future ETA, we have
+        // to decrease it back down to restore balance to the universe.
+        let _prefetch_increment = if tracer.is_delayed() {
             // Task has an ETA, so we need to increment the prefetch count so that
             // we can receive other tasks while we wait for the ETA.
-            if let Err(e) = self.broker.increase_prefetch_count().await {
-                // If for some reason this operation fails, we should stop tracing
-                // this task and send it back to the broker to retry.
-                // Otherwise we could reach the prefetch_count and end up blocking
-                // other deliveries if there are a high number of messages with a
-                // future ETA.
-                self.retry_delivery_if_needed(
-                    delivery.as_ref(),
-                    None,
-                    acks_on_failure_or_timeout,
-                    nacks_enabled,
-                )
-                .await?;
+            let prefetch_increment = match self.broker.increase_prefetch_count().await {
+                Ok(inc) => inc,
+                Err(e) => {
+                    // If for some reason this operation fails, we should stop tracing
+                    // this task and send it back to the broker to retry.
+                    // Otherwise we could reach the prefetch_count and end up blocking
+                    // other deliveries if there are a high number of messages with a
+                    // future ETA.
+                    self.retry_delivery_if_needed(
+                        delivery,
+                        None,
+                        acks_on_failure_or_timeout,
+                        nacks_enabled,
+                    )
+                    .await?;
 
-                self.notify_message_process_failed(
-                    delivery.as_ref(),
-                    acks_on_failure_or_timeout,
-                    nacks_enabled,
-                )
-                .await?;
+                    self.notify_message_process_failed(
+                        delivery,
+                        acks_on_failure_or_timeout,
+                        nacks_enabled,
+                    )
+                    .await?;
 
-                return Err(Box::new(e));
+                    return Err(Box::new(e));
+                }
             };
 
             // Then wait for the task to be ready.
             tracer.wait().await;
-        }
+
+            Some(prefetch_increment)
+        } else {
+            None
+        };
 
         // If acks_late is false, we acknowledge the message before tracing it.
         if !tracer.acks_late() {
-            self.notify_message_processed_successfully(delivery.as_ref())
-                .await?;
+            self.notify_message_processed_successfully(delivery).await?;
             // Notify the broker that the message was processed
-            self.broker.on_message_processed(delivery.as_ref()).await?;
+            self.broker.on_message_processed(delivery).await?;
         }
 
         // Try tracing the task now.
@@ -595,7 +601,7 @@ impl Celery {
         if let Err(TraceError::Retry(retry_eta)) = tracer_result {
             // If retry error -> retry the task.
             self.retry_delivery_if_needed(
-                delivery.as_ref(),
+                delivery,
                 retry_eta,
                 acks_on_failure_or_timeout,
                 nacks_enabled,
@@ -606,27 +612,17 @@ impl Celery {
         // If we have not done it before, we have to acknowledge the message now.
         if tracer.acks_late() {
             if tracer_result.is_ok() {
-                self.notify_message_processed_successfully(delivery.as_ref())
-                    .await?;
+                self.notify_message_processed_successfully(delivery).await?;
             } else {
                 self.notify_message_process_failed(
-                    delivery.as_ref(),
+                    delivery,
                     acks_on_failure_or_timeout,
                     nacks_enabled,
                 )
                 .await?;
             }
             // Notify the broker that the message was processed
-            self.broker.on_message_processed(delivery.as_ref()).await?;
-        }
-
-        // If we had increased the prefetch count above due to a future ETA, we have
-        // to decrease it back down to restore balance to the universe.
-        if tracer.is_delayed() {
-            self.broker
-                .decrease_prefetch_count()
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+            self.broker.on_message_processed(delivery).await?;
         }
 
         Ok(())
@@ -638,7 +634,7 @@ impl Celery {
         delivery: Box<dyn Delivery>,
         event_tx: UnboundedSender<TaskEvent>,
     ) {
-        if let Err(e) = self.try_handle_delivery(delivery, event_tx).await {
+        if let Err(e) = self.try_handle_delivery(delivery.as_ref(), event_tx).await {
             error!("try_handle_delivery error: {e}");
         }
     }
@@ -668,15 +664,15 @@ impl Celery {
             self.broker
                 .ack(delivery)
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
         } else if nacks_enabled {
             self.broker
                 .nack(delivery)
                 .await
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?;
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     /// Retries a delivery only if "nacks_enabled" is false or "acks_on_failure_or_timeout" is true.
@@ -834,7 +830,14 @@ impl Celery {
                             match e.into_any().downcast::<BrokerError>() {
                                 Ok(broker_error) => {
                                     error!("Delivery BrokerError: {broker_error}");
-                                    return Err((*broker_error).into());
+                                    match *broker_error {
+                                        BrokerError::Retry(delivery) => {
+                                            self.broker.retry(delivery.as_ref(), None).await?;
+                                        },
+                                        broker_error => {
+                                            return Err(broker_error.into());
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     error!("Deliver failed: {e:?}");

@@ -163,6 +163,11 @@ pub enum BrokerError {
     /// Any other Redis error that could happen.
     #[error("Redis error \"{0}\"")]
     RedisError(#[from] redis::RedisError),
+
+    /// An error happened after accepting delivery but before tracing.
+    /// Send back to the broker for redelivery.
+    #[error("Retry delivery \"{0}\"")]
+    Retry(Box<dyn crate::broker::Delivery>),
 }
 
 impl BrokerError {

@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use log::error;
-use tokio::time::{self, Duration};
+use tokio::{
+    sync::Semaphore,
+    time::{self, Duration},
+};
 
 use crate::error::BrokerError;
 use crate::{
@@ -18,6 +21,8 @@ mod redis;
 pub use self::redis::{RedisBroker, RedisBrokerBuilder};
 pub use amqp::{AMQPBroker, AMQPBrokerBuilder};
 
+use std::sync::Arc;
+
 #[cfg(test)]
 pub mod mock;
 #[cfg(test)]
@@ -25,7 +30,9 @@ use std::any::Any;
 
 /// The type representing a successful delivery.
 #[async_trait]
-pub trait Delivery: TryDeserializeMessage + Send + Sync + std::fmt::Debug {
+pub trait Delivery:
+    TryDeserializeMessage + Send + Sync + std::fmt::Debug + std::fmt::Display
+{
     async fn resend(
         &self,
         broker: &dyn Broker,
@@ -88,12 +95,8 @@ pub trait Broker: Send + Sync {
     async fn send(&self, message: Message, queue: &str) -> Result<(), BrokerError>;
 
     /// Increase the `prefetch_count`. This has to be done when a task with a future
-    /// ETA is consumed.
-    async fn increase_prefetch_count(&self) -> Result<(), BrokerError>;
-
-    /// Decrease the `prefetch_count`. This has to be done after a task with a future
-    /// ETA is executed.
-    async fn decrease_prefetch_count(&self) -> Result<(), BrokerError>;
+    /// ETA is consumed. Decreases the `prefetch_count` when dropped.
+    async fn increase_prefetch_count(&self) -> Result<IncrementHandle, BrokerError>;
 
     /// Clone all channels and connection.
     async fn close(&self) -> Result<(), BrokerError>;
@@ -225,4 +228,21 @@ pub(crate) async fn build_and_connect(
         error!("Failed to establish connection with broker");
         BrokerError::NotConnected
     })
+}
+
+pub struct IncrementHandle {
+    semaphore: Arc<Semaphore>,
+}
+
+impl IncrementHandle {
+    pub fn new(semaphore: Arc<Semaphore>) -> Self {
+        semaphore.add_permits(1);
+        Self { semaphore }
+    }
+}
+
+impl Drop for IncrementHandle {
+    fn drop(&mut self) {
+        self.semaphore.forget_permits(1);
+    }
 }

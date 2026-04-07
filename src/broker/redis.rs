@@ -1,30 +1,31 @@
 //! Redis broker.
-use super::{Broker, BrokerBuilder, DeliveryError, DeliveryStream};
+use super::{Broker, BrokerBuilder, DeliveryError, DeliveryStream, IncrementHandle};
 use crate::{
     error::{BrokerError, ProtocolError},
     protocol::{self, Message, TryDeserializeMessage},
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::{Stream, TryStreamExt};
+use futures::Stream;
 use redis::{
-    AsyncTypedCommands, Client, ParsingError, RedisError, ToRedisArgs, Value,
+    AsyncTypedCommands, Client, ParsingError, RedisError, ToRedisArgs,
     aio::{ConnectionManager, ConnectionManagerConfig},
     from_redis_value_ref,
-    streams::{StreamId, StreamKey, StreamReadOptions, StreamReadReply},
+    streams::{
+        StreamId, StreamKey, StreamReadOptions, StreamReadReply, StreamTrimOptions,
+        StreamTrimmingMode,
+    },
 };
 use std::{
     clone::Clone,
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU16, Ordering},
-    },
+    collections::{BTreeMap, HashMap},
+    pin::Pin,
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
 use tokio::sync::{
-    RwLock,
+    Mutex, OwnedSemaphorePermit, RwLock, Semaphore,
     mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -35,13 +36,10 @@ use std::any::Any;
 
 static GROUP: &str = "_celery";
 
+type ConsumerStream = dyn Stream<Item = Result<Delivery, Box<dyn DeliveryError>>>;
+
 struct Consumer {
-    conn: ConnectionManager,
-    consumer: Option<Arc<str>>,
-    queue: Arc<dyn RedisQueue>,
-    inner: Option<UnboundedReceiverStream<Result<StreamItem, BrokerError>>>,
-    prefetch_count: Arc<AtomicU16>,
-    pending_tasks: Arc<AtomicU16>,
+    inner: Pin<Box<ConsumerStream>>,
 }
 
 impl DeliveryStream for Consumer {}
@@ -51,15 +49,45 @@ impl DeliveryError for BrokerError {
     }
 }
 
+impl From<BrokerError> for Box<dyn DeliveryError> {
+    fn from(err: BrokerError) -> Self {
+        Box::new(err)
+    }
+}
+
+impl DeliveryError for RedisError {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send + Sync> {
+        self
+    }
+}
+
+impl From<RedisError> for Box<dyn DeliveryError> {
+    fn from(err: RedisError) -> Self {
+        Box::new(err)
+    }
+}
+
 struct Delivery {
-    conn: ConnectionManager,
-    consumer: Option<Arc<str>>,
+    queue: Arc<dyn RedisQueue>,
     item: StreamItem,
+    #[allow(dead_code)]
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for Delivery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.item.fmt(f)
+    }
+}
+
+impl std::fmt::Display for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "queue: {queue}, id: {id}",
+            queue = self.item.key,
+            id = self.item.id
+        )
     }
 }
 
@@ -70,6 +98,7 @@ impl super::Delivery for Delivery {
         broker: &dyn Broker,
         eta: Option<DateTime<Utc>>,
     ) -> Result<(), BrokerError> {
+        self.ack().await?;
         let mut message = self.try_deserialize_message()?;
         message.headers.eta = eta;
         // Increment the number of retries.
@@ -80,13 +109,9 @@ impl super::Delivery for Delivery {
         unimplemented!()
     }
     async fn ack(&self) -> Result<(), BrokerError> {
-        let mut conn = self.conn.clone();
-        let id = self.item.id.as_str();
-        let key = self.item.key.as_ref();
-        if self.consumer.is_some() {
-            conn.xack(key, GROUP, &[id]).await?;
-        }
-        conn.xdel(key, &[id]).await?;
+        self.queue
+            .ack(self.item.key.clone(), self.item.id.clone())
+            .await;
         Ok(())
     }
     async fn nack(&self) -> Result<(), BrokerError> {
@@ -102,42 +127,15 @@ impl Stream for Consumer {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<<Self as futures::Stream>::Item>> {
         use futures_lite::stream::StreamExt;
-
-        let mut result: Poll<Option<<Self as futures::Stream>::Item>> = Poll::Pending;
-
-        let _ = self.pending_tasks.clone().fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |pending_tasks| {
-                let prefetch_count = self.prefetch_count.load(Ordering::SeqCst);
-                let inner = self.inner.take();
-                if pending_tasks >= prefetch_count {
-                    log::trace!("Pending tasks limit reached");
-                } else if let Some(mut inner) = inner.or_else(|| self.queue.subscribe()) {
-                    match inner.poll_next(cx) {
-                        Poll::Ready(None) => {}
-                        Poll::Pending => {
-                            self.inner = Some(inner);
-                        }
-                        Poll::Ready(Some(Err(err))) => {
-                            result = Poll::Ready(Some(Err(Box::new(err))));
-                        }
-                        Poll::Ready(Some(Ok(item))) => {
-                            self.inner = Some(inner);
-                            result = Poll::Ready(Some(Ok(Box::new(Delivery {
-                                conn: self.conn.clone(),
-                                consumer: self.consumer.clone(),
-                                item,
-                            }))));
-                            return Some(pending_tasks + 1);
-                        }
-                    }
-                }
-                None
-            },
-        );
-
-        result
+        use std::task::Poll;
+        match self.inner.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(Some(Ok(item))) => {
+                Poll::Ready(Some(Ok(Box::new(item) as Box<dyn super::Delivery>)))
+            }
+        }
     }
 }
 
@@ -206,7 +204,7 @@ impl BrokerBuilder for RedisBrokerBuilder {
     /// Set the heartbeat.
     fn heartbeat(mut self: Box<Self>, heartbeat: Option<u16>) -> Box<dyn BrokerBuilder> {
         if heartbeat.is_some() {
-            log::warn!("Setting heartbeat on redis broker has no effect on anything");
+            log::warn!("Setting heartbeat on redis broker has no effect");
         }
         self.config.heartbeat = heartbeat;
         self
@@ -218,7 +216,7 @@ impl BrokerBuilder for RedisBrokerBuilder {
         _queue_name: &str,
         _queue_expire_time_ms: u32,
     ) -> Box<dyn BrokerBuilder> {
-        log::warn!("Setting queue_expire_time on redis broker has no effect on anything");
+        log::warn!("Setting queue_expire_time on redis broker has no effect");
         self
     }
 
@@ -228,7 +226,7 @@ impl BrokerBuilder for RedisBrokerBuilder {
         _queue_name: &str,
         _queue_message_ttl_ms: u32,
     ) -> Box<dyn BrokerBuilder> {
-        log::warn!("Setting queue_message_ttl on redis broker has no effect on anything");
+        log::warn!("Setting queue_message_ttl on redis broker has no effect");
         self
     }
 
@@ -238,7 +236,7 @@ impl BrokerBuilder for RedisBrokerBuilder {
         _queue_name: &str,
         _queue_type: &str,
     ) -> Box<dyn BrokerBuilder> {
-        log::warn!("Setting queue_type on redis broker has no effect on anything");
+        log::warn!("Setting queue_type on redis broker has no effect");
         self
     }
 
@@ -246,16 +244,20 @@ impl BrokerBuilder for RedisBrokerBuilder {
     async fn build(&self, connection_timeout: u32) -> Result<Box<dyn Broker>, BrokerError> {
         let url = self.config.broker_url.as_str();
         let consumer = Uuid::new_v4().hyphenated().to_string();
-        let conn = RedisBroker::connect(url, connection_timeout).await?;
-        let queues =
-            declare_queues(url, connection_timeout, &consumer, &self.config.queues).await?;
+        let timeout = Duration::from_secs(connection_timeout as u64);
+        let conn = RedisBroker::connect(url, timeout).await?;
+
+        let prefetch_count = self.config.prefetch_count.clamp(1, u16::MAX);
+        log::debug!("Setting global prefetch limit to {prefetch_count}");
+        let pending_tasks = Arc::new(Semaphore::new(prefetch_count as usize));
+
+        let queues = declare_queues(url, timeout, &consumer, &self.config.queues).await?;
 
         Ok(Box::new(RedisBroker {
             uri: self.config.broker_url.clone(),
             conn,
             consumer: consumer.as_str().into(),
-            prefetch_count: Arc::new(AtomicU16::new(self.config.prefetch_count)),
-            pending_tasks: Arc::new(AtomicU16::new(0)),
+            pending_tasks,
             queues: RwLock::new(queues),
             queue_declare_options: self.config.queues.clone(),
         }))
@@ -272,27 +274,24 @@ pub struct RedisBroker {
     queues: RwLock<HashMap<String, Arc<dyn RedisQueue>>>,
     queue_declare_options: HashMap<String, QueueConfig>,
 
-    /// Need to keep track of prefetch count. We put this behind a mutex to get interior
-    /// mutability.
-    prefetch_count: Arc<AtomicU16>,
-    pending_tasks: Arc<AtomicU16>,
-    // waker_rx: Mutex<Receiver<Waker>>,
-    // waker_tx: Sender<Waker>,
-
-    // delivery_info: DeliveryInfo,
+    /// Keep track of and enforce global prefetch count.
+    pending_tasks: Arc<Semaphore>,
 }
 
 impl RedisBroker {
-    async fn connect(uri: &str, connection_timeout: u32) -> Result<ConnectionManager, BrokerError> {
+    async fn connect(
+        uri: &str,
+        connection_timeout: Duration,
+    ) -> Result<ConnectionManager, BrokerError> {
         log::debug!("Creating client");
         let client = Client::open(uri).map_err(|_| BrokerError::InvalidBrokerUrl(safe_url(uri)))?;
 
-        log::debug!("Creating connection manager with connection_timeout={connection_timeout}");
+        log::debug!("Creating connection manager with connection_timeout={connection_timeout:?}");
         let conn = client
             .get_connection_manager_with_config(
                 ConnectionManagerConfig::new()
-                    .set_connection_timeout(Duration::from_secs(connection_timeout as u64).into())
-                    .set_response_timeout(Duration::from_millis(500).into()),
+                    .set_connection_timeout(connection_timeout.into())
+                    .set_response_timeout(connection_timeout.into()),
             )
             .await?;
 
@@ -315,18 +314,47 @@ impl Broker for RedisBroker {
             .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?
             .clone();
 
-        Ok((
-            // Create unique consumer tag.
-            Uuid::new_v4().hyphenated().to_string(),
-            Box::new(Consumer {
-                conn: self.conn.clone(),
-                consumer: queue.consumer(),
-                queue,
-                inner: None,
-                prefetch_count: self.prefetch_count.clone(),
-                pending_tasks: self.pending_tasks.clone(),
+        // Create unique consumer tag.
+        let consumer_tag = Uuid::new_v4().hyphenated().to_string();
+        let pending_tasks = self.pending_tasks.clone();
+
+        let consumer = Box::new(Consumer {
+            inner: Box::pin(async_stream::stream! {
+                use futures_lite::stream::StreamExt;
+
+                let mut last_id = None;
+
+                loop {
+                    let item = match queue.subscribe(last_id.clone()).next().await {
+                        None => {
+                            continue;
+                        },
+                        Some(Err(err)) => {
+                            yield Err(err.into());
+                            continue;
+                        },
+                        Some(Ok(item)) => {
+                            last_id.replace(item.id.clone());
+                            item
+                        },
+                    };
+
+                    let delivery = Delivery {
+                        item,
+                        queue: queue.clone(),
+                        permit: pending_tasks.clone().acquire_owned().await.ok(),
+                    };
+
+                    if delivery.permit.is_some() {
+                        yield Ok(delivery);
+                    } else {
+                        yield Err(BrokerError::Retry(Box::new(delivery)).into());
+                    }
+                }
             }),
-        ))
+        });
+
+        Ok((consumer_tag, consumer))
     }
 
     async fn cancel(&self, _consumer_tag: &str) -> Result<(), BrokerError> {
@@ -334,7 +362,6 @@ impl Broker for RedisBroker {
     }
 
     async fn ack(&self, delivery: &dyn super::Delivery) -> Result<(), BrokerError> {
-        self.pending_tasks.fetch_sub(1, Ordering::SeqCst);
         delivery.ack().await
     }
 
@@ -355,27 +382,31 @@ impl Broker for RedisBroker {
 
     /// Send a [`Message`](protocol/struct.Message.html) into a queue.
     async fn send(&self, message: Message, queue: &str) -> Result<(), BrokerError> {
-        self.queues
-            .read()
-            .await
-            .get(queue)
-            .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?
-            .send(self.conn.clone(), message)
-            .await
+        if let Some(queue) = self.queues.read().await.get(queue) {
+            queue.send(self.conn.clone(), message).await?;
+        } else {
+            self.conn
+                .clone()
+                .xadd(
+                    queue,
+                    "*",
+                    &[
+                        // TODO: Use redis serialization instead of JSON
+                        ("json", message.json_serialized(None)?),
+                        // ("properties", &message.properties.to_redis_args()),
+                        // ("headers", &message.headers.to_redis_args()),
+                        // ("raw_body", &message.raw_body.to_redis_args()),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// Increase the `prefetch_count`. This has to be done when a task with a future
     /// ETA is consumed.
-    async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
-        self.prefetch_count.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Decrease the `prefetch_count`. This has to be done after a task with a future
-    /// ETA is executed.
-    async fn decrease_prefetch_count(&self) -> Result<(), BrokerError> {
-        self.prefetch_count.fetch_sub(1, Ordering::SeqCst);
-        Ok(())
+    async fn increase_prefetch_count(&self) -> Result<IncrementHandle, BrokerError> {
+        Ok(IncrementHandle::new(self.pending_tasks.clone()))
     }
 
     /// Clone all channels and connection.
@@ -392,42 +423,32 @@ impl Broker for RedisBroker {
     async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError> {
         let mut conn = self.conn.clone();
         let mut queues = self.queues.write().await;
-        let duration = Duration::from_secs(connection_timeout as u64);
-
+        let connection_timeout = Duration::from_secs(connection_timeout as u64);
         // Stop additional task fetching
-        let old_prefetch_count = self.prefetch_count.fetch_and(0, Ordering::SeqCst);
+        let old_prefetch_count = self.pending_tasks.forget_permits(Semaphore::MAX_PERMITS);
 
         let start = Instant::now();
         let mut result = Err(BrokerError::NotConnected);
 
-        while start.elapsed() < duration {
+        while result.is_err() && start.elapsed() < connection_timeout {
             // Wait for reconnect or timeout
-            let res = tokio::time::timeout(duration, conn.ping()).await;
-
-            match res {
-                Ok(Ok(res)) if res == "PONG" => {
-                    *queues = declare_queues(
-                        &self.uri,
-                        connection_timeout,
-                        &self.consumer,
-                        &self.queue_declare_options,
-                    )
-                    .await?;
-                    result = Ok(());
-                    break;
-                }
-                res => {
-                    result = match res {
-                        Ok(Err(e)) => Err(BrokerError::RedisError(e)),
-                        Ok(Ok(_)) => Err(BrokerError::NotConnected),
-                        Err(_) => Err(BrokerError::NotConnected),
-                    };
-                }
+            result = match tokio::time::timeout(connection_timeout, conn.ping()).await {
+                Ok(Ok(res)) if res == "PONG" => declare_queues(
+                    &self.uri,
+                    connection_timeout,
+                    &self.consumer,
+                    &self.queue_declare_options,
+                )
+                .await
+                .map(|qs| {
+                    *queues = qs;
+                    self.pending_tasks.add_permits(old_prefetch_count);
+                }),
+                Ok(Err(e)) => Err(BrokerError::RedisError(e)),
+                Ok(Ok(_)) => Err(BrokerError::NotConnected),
+                Err(_) => Err(BrokerError::NotConnected),
             }
         }
-
-        self.prefetch_count
-            .store(old_prefetch_count, Ordering::SeqCst);
 
         result
     }
@@ -440,20 +461,24 @@ impl Broker for RedisBroker {
 
 async fn declare_queues(
     url: &str,
-    connection_timeout: u32,
+    connection_timeout: Duration,
     consumer: &str,
     queues: &HashMap<String, QueueConfig>,
 ) -> Result<HashMap<String, Arc<dyn RedisQueue>>, BrokerError> {
+    use futures::TryStreamExt;
+
     log::debug!("Creating streams");
 
     let broadcast = Arc::new(RedisStreamsBatchReader::broadcast(
         queues.iter().filter(|(_, c)| c.broadcast).count(),
         RedisBroker::connect(url, connection_timeout).await?,
+        connection_timeout / 2,
     ));
 
     let cooperative = Arc::new(RedisStreamsBatchReader::cooperative(
         queues.iter().filter(|(_, c)| !c.broadcast).count(),
         RedisBroker::connect(url, connection_timeout).await?,
+        connection_timeout / 2,
         GROUP,
         consumer,
     ));
@@ -495,6 +520,8 @@ fn safe_url(broker_url: &str) -> String {
 trait RedisQueue: Send + Sync {
     fn name(&self) -> &str;
 
+    async fn ack(&self, key: StreamName, id: String);
+
     async fn send(&self, mut conn: ConnectionManager, message: Message) -> Result<(), BrokerError> {
         conn.xadd(
             self.name(),
@@ -508,13 +535,13 @@ trait RedisQueue: Send + Sync {
             ],
         )
         .await?;
-        // tokio::time::sleep(Duration::from_millis(1)).await;
         Ok(())
     }
 
-    fn consumer(&self) -> Option<Arc<str>>;
-
-    fn subscribe(&self) -> Option<UnboundedReceiverStream<Result<StreamItem, BrokerError>>>;
+    fn subscribe(
+        &self,
+        last_id: Option<String>,
+    ) -> UnboundedReceiverStream<Result<StreamItem, BrokerError>>;
 }
 
 struct BroadcastQueue {
@@ -522,17 +549,22 @@ struct BroadcastQueue {
     reader: Arc<RedisStreamsBatchReader>,
 }
 
+#[async_trait]
 impl RedisQueue for BroadcastQueue {
-    fn consumer(&self) -> Option<Arc<str>> {
-        None
+    async fn ack(&self, key: StreamName, id: String) {
+        self.reader.ack(key, id).await
     }
 
     fn name(&self) -> &str {
         self.queue.as_str()
     }
 
-    fn subscribe(&self) -> Option<UnboundedReceiverStream<Result<StreamItem, BrokerError>>> {
-        self.reader.subscribe(self.name().into(), Some("$".into()))
+    fn subscribe(
+        &self,
+        last_id: Option<String>,
+    ) -> UnboundedReceiverStream<Result<StreamItem, BrokerError>> {
+        self.reader
+            .subscribe(self.name().into(), last_id.or_else(|| Some("$".into())))
     }
 }
 
@@ -557,20 +589,23 @@ impl BroadcastQueue {
 
 struct CooperativeQueue {
     queue: String,
-    consumer: Arc<str>,
     reader: Arc<RedisStreamsBatchReader>,
 }
 
+#[async_trait]
 impl RedisQueue for CooperativeQueue {
-    fn consumer(&self) -> Option<Arc<str>> {
-        Some(self.consumer.clone())
+    async fn ack(&self, key: StreamName, id: String) {
+        self.reader.ack(key, id).await
     }
 
     fn name(&self) -> &str {
         self.queue.as_str()
     }
 
-    fn subscribe(&self) -> Option<UnboundedReceiverStream<Result<StreamItem, BrokerError>>> {
+    fn subscribe(
+        &self,
+        _last_id: Option<String>,
+    ) -> UnboundedReceiverStream<Result<StreamItem, BrokerError>> {
         self.reader.subscribe(self.name().into(), Some(">".into()))
     }
 }
@@ -588,7 +623,6 @@ impl CooperativeQueue {
         let _ = conn.xgroup_createconsumer(queue, group, consumer).await?;
         Ok(Arc::new(Self {
             reader,
-            consumer: consumer.into(),
             queue: queue.to_string(),
         }))
     }
@@ -606,6 +640,7 @@ struct StreamItem {
 struct RedisStreamsBatchReader {
     conn: ConnectionManager,
     observers: UnboundedSender<StreamObserver>,
+    processed: Arc<Mutex<BTreeMap<StreamName, Vec<String>>>>,
     #[allow(dead_code)]
     handle: Arc<tokio_util::task::AbortOnDropHandle<()>>,
 }
@@ -616,7 +651,7 @@ impl RedisStreamsBatchReader {
         &self,
         key: StreamName,
         last_id: P,
-    ) -> Option<UnboundedReceiverStream<Result<StreamItem, BrokerError>>> {
+    ) -> UnboundedReceiverStream<Result<StreamItem, BrokerError>> {
         let (sender, receiver) = mpsc::unbounded_channel();
         self.observers
             .send(StreamObserver {
@@ -626,29 +661,44 @@ impl RedisStreamsBatchReader {
                 callback: sender,
             })
             .ok();
-        Some(UnboundedReceiverStream::new(receiver))
+        UnboundedReceiverStream::new(receiver)
     }
 
-    pub fn broadcast(size: usize, conn: ConnectionManager) -> Self {
-        Self::new(size, conn, StreamReadOptions::default().count(1).block(250))
-    }
-
-    pub fn cooperative(size: usize, conn: ConnectionManager, group: &str, consumer: &str) -> Self {
+    pub fn broadcast(size: usize, conn: ConnectionManager, wait_time: Duration) -> Self {
         Self::new(
             size,
             conn,
             StreamReadOptions::default()
                 .count(1)
-                .block(250)
+                .block(wait_time.as_millis() as usize),
+        )
+    }
+
+    pub fn cooperative(
+        size: usize,
+        conn: ConnectionManager,
+        wait_time: Duration,
+        group: &str,
+        consumer: &str,
+    ) -> Self {
+        Self::new(
+            size,
+            conn,
+            StreamReadOptions::default()
+                .count(1)
+                .block(wait_time.as_millis() as usize)
                 .group(group, consumer),
         )
     }
 
     fn new(size: usize, mut conn: ConnectionManager, opts: StreamReadOptions) -> Self {
         let (observers_tx, mut observers_rx) = mpsc::unbounded_channel();
+        let processed = Arc::new(Mutex::new(BTreeMap::new()));
+
         Self {
             conn: conn.clone(),
             observers: observers_tx.clone(),
+            processed: processed.clone(),
             handle: Arc::new(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
                 async move {
                     let mut stream_keys = Vec::with_capacity(size);
@@ -665,6 +715,17 @@ impl RedisStreamsBatchReader {
                         .await
                         {
                             break; // The observers channel has been closed
+                        }
+
+                        // Acknowledge and delete processed messages
+                        if let Err(err) =
+                            Self::ack_messages(&mut conn, &opts, processed.as_ref(), &mut callbacks)
+                                .await
+                        {
+                            for obs in callbacks.values() {
+                                let _ = obs.on_error(BrokerError::RedisError(err.clone()));
+                            }
+                            break;
                         }
 
                         // Read stream values and notify each observer
@@ -688,6 +749,10 @@ impl RedisStreamsBatchReader {
                 },
             ))),
         }
+    }
+
+    pub async fn ack(&self, key: StreamName, id: String) {
+        self.processed.lock().await.entry(key).or_default().push(id)
     }
 
     async fn pull_observers(
@@ -724,6 +789,43 @@ impl RedisStreamsBatchReader {
         }
     }
 
+    async fn ack_messages(
+        conn: &mut ConnectionManager,
+        opts: &StreamReadOptions,
+        processed: &Mutex<BTreeMap<StreamName, Vec<String>>>,
+        callbacks: &mut HashMap<StreamName, StreamObserver>,
+    ) -> Result<(), RedisError> {
+        let mut processed = processed.lock().await;
+        while let Some((key, ids)) = processed.pop_first() {
+            if opts.read_only() {
+                let one_minute_ago = ids
+                    .iter()
+                    .filter_map(|id| id.split('-').next())
+                    .filter_map(|id| id.parse::<i64>().ok())
+                    .min()
+                    .unwrap_or_else(|| chrono::Local::now().timestamp_millis())
+                    .saturating_sub(Duration::from_secs(60).as_millis() as i64)
+                    .to_string();
+
+                conn.xtrim_options(
+                    key.as_ref(),
+                    &StreamTrimOptions::minid(StreamTrimmingMode::Approx, one_minute_ago),
+                )
+                .await?;
+            } else {
+                conn.xack(key.as_ref(), GROUP, &ids).await?;
+                if let Some(obs) = callbacks.get_mut(key.as_ref())
+                    && obs.last_id != ">"
+                    && ids.contains(&obs.last_id)
+                {
+                    obs.last_id = ">".into();
+                }
+                conn.xdel(key.as_ref(), &ids).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn read_streams(
         conn: &mut ConnectionManager,
         opts: &StreamReadOptions,
@@ -751,13 +853,11 @@ impl RedisStreamsBatchReader {
             for StreamKey { key, ids } in res.keys {
                 // Match received Redis messages with their subscriber's channel
                 if let Some(obs) = callbacks.get_mut(key.as_str()) {
-                    for StreamId { id, map, .. } in ids {
-                        if opts.read_only() {
-                            // update latest message id for a given stream
-                            obs.last_id = id.clone();
-                        }
+                    for id in ids {
+                        // update latest message id for a given stream
+                        obs.last_id = id.id.clone();
                         // forward message to subscriber
-                        if obs.on_next(id, map).is_err() {
+                        if obs.on_next(id).is_err() {
                             // sender is closed, remove it
                             callbacks.remove(key.as_str());
                             break;
@@ -807,13 +907,12 @@ impl StreamObserver {
 
     pub fn on_next(
         &self,
-        id: String,
-        message: HashMap<String, Value>,
+        id: StreamId,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<Result<StreamItem, BrokerError>>> {
-        if let Some(json) = message.get("json") {
+        if let Some(json) = id.map.get("json") {
             self.callback.send(Ok(StreamItem {
                 key: self.key.clone(),
-                id,
+                id: id.id,
                 json: from_redis_value_ref::<String>(json),
             }))
         } else {

@@ -118,11 +118,18 @@ async fn main() -> Result<()> {
                 my_app
                     .send_task(long_running_task::new(Some(3)).with_time_limit(2))
                     .await?;
+
                 // Send the long running task that will succeed.
-                for _ in 0..100 {
+                for _ in 0..20 {
                     my_app
-                        .send_task(long_running_task::new(Some(10)).with_time_limit(20))
+                        .send_task(long_running_task::new(Some(3)).with_time_limit(20))
                         .await?;
+                    time::sleep(Duration::from_millis(10)).await;
+                    // Broadcast the same message to multiple consumers.
+                    my_app
+                        .send_task(broadcast_task::new("hello!".into()))
+                        .await?;
+                    time::sleep(Duration::from_millis(10)).await;
                 }
             } else {
                 for task in tasks {
