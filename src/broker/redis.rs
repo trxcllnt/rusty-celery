@@ -764,28 +764,26 @@ impl RedisStreamsBatchReader {
         message_ids.clear();
         let mut idx = 0;
         let len = callbacks.capacity();
-        // Wait for the first observer
-        if idx < len
-            && let Some(obs) = observers_rx.recv().await
-        {
-            stream_keys.push(obs.key.clone());
-            message_ids.push(obs.last_id.clone());
-            callbacks.insert(obs.key.clone(), obs);
-
-            // Eagerly pull more observers to fill the whole senders map
-            while idx < len
-                && let Ok(obs) = observers_rx.try_recv()
-            {
+        loop {
+            if idx >= len {
+                return idx > 0;
+            }
+            let obs = if idx == 0 {
+                // Wait for the first observer
+                observers_rx.recv().await
+            } else {
+                // Eagerly pull more observers to fill the whole senders map
+                observers_rx.try_recv().ok()
+            };
+            if let Some(obs) = obs {
                 idx += 1;
                 stream_keys.push(obs.key.clone());
                 message_ids.push(obs.last_id.clone());
                 callbacks.insert(obs.key.clone(), obs);
+            } else {
+                // We filled up to the batch size, or no more pending tasks
+                idx = len;
             }
-
-            // We filled up to the batch size, or no more pending tasks
-            true
-        } else {
-            false
         }
     }
 
@@ -814,11 +812,11 @@ impl RedisStreamsBatchReader {
                 .await?;
             } else {
                 conn.xack(key.as_ref(), GROUP, &ids).await?;
-                if let Some(obs) = callbacks.get_mut(key.as_ref())
-                    && obs.last_id != ">"
-                    && ids.contains(&obs.last_id)
-                {
-                    obs.last_id = ">".into();
+                #[allow(clippy::collapsible_if)]
+                if let Some(obs) = callbacks.get_mut(key.as_ref()) {
+                    if obs.last_id != ">" && ids.contains(&obs.last_id) {
+                        obs.last_id = ">".into();
+                    }
                 }
                 conn.xdel(key.as_ref(), &ids).await?;
             }
