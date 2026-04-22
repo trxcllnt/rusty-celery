@@ -342,6 +342,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
             produce_channel: RwLock::new(produce_channel),
             pending_tasks,
             queues: RwLock::new(queues),
+            consumer_tags_to_queue: Default::default(),
             queue_declare_options: self.config.queues.clone(),
         }))
     }
@@ -368,6 +369,7 @@ pub struct AMQPBroker {
     ///
     /// This is only wrapped in RwLock for interior mutability.
     queues: RwLock<HashMap<String, Arc<dyn AMQPQueue>>>,
+    consumer_tags_to_queue: RwLock<HashMap<String, String>>,
 
     queue_declare_options: HashMap<String, QueueConfig>,
 
@@ -416,6 +418,11 @@ impl Broker for AMQPBroker {
         let consumer_tag = consumer.tag().to_string();
         let pending_tasks = self.pending_tasks.clone();
 
+        self.consumer_tags_to_queue
+            .write()
+            .await
+            .insert(consumer_tag.clone(), queue.name().to_owned());
+
         let consumer = Box::new(Consumer {
             inner: Box::pin(async_stream::stream! {
                 for await item in consumer {
@@ -446,9 +453,17 @@ impl Broker for AMQPBroker {
 
     async fn cancel(&self, consumer_tag: &str) -> Result<(), BrokerError> {
         let consume_channel = self.consume_channel.write().await;
-        consume_channel
-            .basic_cancel(consumer_tag, BasicCancelOptions::default())
-            .await?;
+        #[allow(clippy::collapsible_if)]
+        if let Some(queue) = self
+            .consumer_tags_to_queue
+            .write()
+            .await
+            .remove(consumer_tag)
+        {
+            if let Some(queue) = self.queues.write().await.remove(&queue) {
+                queue.close(&consume_channel, consumer_tag).await?;
+            }
+        }
         Ok(())
     }
 
@@ -585,6 +600,9 @@ trait AMQPQueue: Send + Sync {
     }
 
     async fn send(&self, produce_channel: &Channel, message: Message) -> Result<(), BrokerError>;
+
+    async fn close(&self, consume_channel: &Channel, consumer_tag: &str)
+    -> Result<(), BrokerError>;
 }
 
 struct CooperativeQueue {
@@ -623,6 +641,17 @@ impl AMQPQueue for CooperativeQueue {
                 &message.raw_body[..],
                 properties,
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn close(
+        &self,
+        consume_channel: &Channel,
+        consumer_tag: &str,
+    ) -> Result<(), BrokerError> {
+        consume_channel
+            .basic_cancel(consumer_tag, BasicCancelOptions::default())
             .await?;
         Ok(())
     }
@@ -700,6 +729,26 @@ impl AMQPQueue for BroadcastQueue {
                 &message.raw_body[..],
                 properties,
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn close(
+        &self,
+        consume_channel: &Channel,
+        consumer_tag: &str,
+    ) -> Result<(), BrokerError> {
+        // unbind the anonymous queue from the fanout exchange
+        consume_channel
+            .queue_unbind(
+                self.inner.name().as_str(),
+                self.queue.as_str(),
+                "",
+                Default::default(),
+            )
+            .await?;
+        consume_channel
+            .basic_cancel(consumer_tag, BasicCancelOptions::default())
             .await?;
         Ok(())
     }
