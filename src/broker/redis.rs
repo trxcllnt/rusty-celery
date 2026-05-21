@@ -112,7 +112,7 @@ impl BrokerBuilder for RedisBrokerBuilder {
         // let blocking_conn = client.get_connection().unwrap();
 
         log::info!("Creating tokio manager");
-        let manager = client.get_tokio_connection_manager().await?;
+        let manager = client.get_connection_manager().await?;
 
         log::info!("Creating mpsc channel");
         let (tx, rx) = channel(1);
@@ -229,7 +229,7 @@ impl Channel {
         redis::cmd("HDEL")
             .arg(self.process_map_name())
             .arg(&delivery.properties.correlation_id)
-            .query_async::<ConnectionManager, ()>(&mut self.connection.clone())
+            .query_async::<()>(&mut self.connection.clone())
             .await?;
         Ok(())
     }
@@ -418,9 +418,7 @@ impl Broker for RedisBroker {
     /// Clone all channels and connection.
     async fn close(&self) -> Result<(), BrokerError> {
         let mut conn = self.manager.clone();
-        redis::cmd("QUIT")
-            .query_async::<ConnectionManager, ()>(&mut conn)
-            .await?;
+        redis::cmd("QUIT").query_async::<()>(&mut conn).await?;
         Ok(())
     }
 
