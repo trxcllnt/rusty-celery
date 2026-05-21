@@ -20,7 +20,6 @@ use tokio::sync::{Mutex, RwLock};
 use super::{Broker, BrokerBuilder, DeliveryError, DeliveryStream};
 use crate::error::{BrokerError, ProtocolError};
 use crate::protocol::{Message, MessageHeaders, MessageProperties, TryDeserializeMessage};
-use tokio_executor_trait::Tokio as TokioExecutor;
 
 #[cfg(test)]
 use std::any::Any;
@@ -48,11 +47,11 @@ impl super::Delivery for Delivery {
         todo!()
     }
     async fn ack(&self) -> Result<(), BrokerError> {
-        lapin::acker::Acker::ack(self, BasicAckOptions::default()).await?;
+        lapin::Acker::ack(self, BasicAckOptions::default()).await?;
         Ok(())
     }
     async fn nack(&self) -> Result<(), BrokerError> {
-        lapin::acker::Acker::nack(self, BasicNackOptions::default()).await?;
+        lapin::Acker::nack(self, BasicNackOptions::default()).await?;
         Ok(())
     }
 }
@@ -111,20 +110,6 @@ struct Config {
 /// Builds an [`AMQPBroker`] with a custom configuration.
 pub struct AMQPBrokerBuilder {
     config: Config,
-}
-
-fn create_base_connection_properties() -> ConnectionProperties {
-    // See https://github.com/amqp-rs/reactor-trait/issues/1#issuecomment-1033473197
-    ConnectionProperties::default().with_executor(TokioExecutor::current())
-}
-
-#[cfg(unix)]
-fn create_connection_properties() -> ConnectionProperties {
-    create_base_connection_properties().with_reactor(tokio_reactor_trait::Tokio)
-}
-#[cfg(windows)]
-fn create_connection_properties() -> ConnectionProperties {
-    create_base_connection_properties()
 }
 
 #[async_trait]
@@ -229,7 +214,12 @@ impl BrokerBuilder for AMQPBrokerBuilder {
         uri.query.heartbeat = self.config.heartbeat;
         uri.query.connection_timeout = Some((connection_timeout as u64) * 1000);
 
-        let conn = Connection::connect_uri(uri.clone(), create_connection_properties()).await?;
+        let conn = Connection::connect_uri_with_runtime(
+            uri.clone(),
+            ConnectionProperties::default(),
+            async_rs::Runtime::tokio_current(),
+        )
+        .await?;
 
         let consume_channel = conn.create_channel().await?;
         let produce_channel = conn.create_channel().await?;
@@ -237,7 +227,11 @@ impl BrokerBuilder for AMQPBrokerBuilder {
         let mut queues: HashMap<String, Queue> = HashMap::new();
         for (queue_name, queue_config) in &self.config.queues {
             let queue = consume_channel
-                .queue_declare(queue_name, queue_config.options, queue_config.into())
+                .queue_declare(
+                    queue_name.as_str().into(),
+                    queue_config.options,
+                    queue_config.into(),
+                )
                 .await?;
             queues.insert(queue_name.into(), queue);
         }
@@ -318,12 +312,12 @@ impl Broker for AMQPBroker {
     async fn consume(
         &self,
         queue: &str,
-        error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
+        _error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
     ) -> Result<(String, Box<dyn DeliveryStream>), BrokerError> {
-        self.conn
-            .lock()
-            .await
-            .on_error(move |e| error_handler(BrokerError::from(e)));
+        // self.conn
+        //     .lock()
+        //     .await
+        //     .on_error(move |e| error_handler(BrokerError::from(e)));
         let queues = self.queues.read().await;
         let queue = queues
             .get(queue)
@@ -334,8 +328,8 @@ impl Broker for AMQPBroker {
                 .read()
                 .await
                 .basic_consume(
-                    queue.name().as_str(),
-                    "",
+                    queue.name().as_str().into(),
+                    "".into(),
                     BasicConsumeOptions::default(),
                     FieldTable::default(),
                 )
@@ -347,7 +341,7 @@ impl Broker for AMQPBroker {
     async fn cancel(&self, consumer_tag: &str) -> Result<(), BrokerError> {
         let consume_channel = self.consume_channel.write().await;
         consume_channel
-            .basic_cancel(consumer_tag, BasicCancelOptions::default())
+            .basic_cancel(consumer_tag.into(), BasicCancelOptions::default())
             .await?;
         Ok(())
     }
@@ -376,8 +370,8 @@ impl Broker for AMQPBroker {
             .read()
             .await
             .basic_publish(
-                "",
-                queue,
+                "".into(),
+                queue.into(),
                 BasicPublishOptions::default(),
                 &message.raw_body.clone()[..],
                 properties,
@@ -425,17 +419,17 @@ impl Broker for AMQPBroker {
 
         if consume_channel.status().connected() {
             debug!("Closing consumer channel...");
-            consume_channel.close(200, "OK").await?;
+            consume_channel.close(200, "OK".into()).await?;
         }
 
         if produce_channel.status().connected() {
             debug!("Closing producer channel...");
-            produce_channel.close(200, "OK").await?;
+            produce_channel.close(200, "OK".into()).await?;
         }
 
         if conn.status().connected() {
             debug!("Closing connection...");
-            conn.close(200, "OK").await?;
+            conn.close(200, "OK".into()).await?;
         }
 
         Ok(())
@@ -448,7 +442,12 @@ impl Broker for AMQPBroker {
             debug!("Attempting to reconnect to broker");
             let mut uri = self.uri.clone();
             uri.query.connection_timeout = Some(connection_timeout as u64);
-            *conn = Connection::connect_uri(uri, create_connection_properties()).await?;
+            *conn = Connection::connect_uri_with_runtime(
+                uri,
+                ConnectionProperties::default(),
+                async_rs::Runtime::tokio_current(),
+            )
+            .await?;
 
             let mut consume_channel = self.consume_channel.write().await;
             let mut produce_channel = self.produce_channel.write().await;
@@ -460,7 +459,11 @@ impl Broker for AMQPBroker {
             queues.clear();
             for (queue_name, queue_config) in &self.queue_declare_options {
                 let queue = consume_channel
-                    .queue_declare(queue_name, queue_config.options, queue_config.into())
+                    .queue_declare(
+                        queue_name.as_str().into(),
+                        queue_config.options,
+                        queue_config.into(),
+                    )
                     .await?;
                 queues.insert(queue_name.into(), queue);
             }
@@ -697,7 +700,6 @@ fn amqp_value_to_u32(v: &AMQPValue) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lapin::types::ShortString;
     use std::time::SystemTime;
 
     #[test]
@@ -738,15 +740,15 @@ mod tests {
             raw_body: vec![],
         };
 
-        let delivery = Delivery {
-            delivery_tag: 0,
-            exchange: ShortString::from(""),
-            routing_key: ShortString::from("celery"),
-            redelivered: false,
-            properties: message.delivery_properties(),
-            data: vec![],
-            acker: Default::default(),
-        };
+        let mut delivery = Delivery::mock(
+            0,               // delivery_tag
+            "".into(),       // exchange
+            "celery".into(), // routing_key
+            false,           // redelivered
+            vec![],          // data
+        );
+
+        delivery.properties = message.delivery_properties();
 
         let message2 = delivery.try_deserialize_message();
         assert!(message2.is_ok());

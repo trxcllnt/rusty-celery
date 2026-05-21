@@ -170,10 +170,10 @@ impl BrokerError {
         match self {
             BrokerError::IoError(_) | BrokerError::NotConnected => true,
             BrokerError::AMQPError(err) => matches!(
-                err,
-                lapin::Error::ProtocolError(_)
-                    | lapin::Error::InvalidConnectionState(_)
-                    | lapin::Error::InvalidChannelState(_)
+                err.kind(),
+                lapin::ErrorKind::ProtocolError(_)
+                    | lapin::ErrorKind::InvalidConnectionState(_)
+                    | lapin::ErrorKind::InvalidChannelState(_, _)
             ),
             BrokerError::RedisError(err) => {
                 err.is_connection_dropped() || err.is_connection_refusal()
