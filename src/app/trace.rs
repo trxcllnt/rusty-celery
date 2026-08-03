@@ -53,7 +53,7 @@ where
             warn!(
                 "Task {}[{}] expired, discarding",
                 self.task.name(),
-                &self.task.request().id,
+                self.task.request().id,
             );
             return Err(TraceError::ExpirationError);
         }
@@ -84,7 +84,7 @@ where
                 info!(
                     "Task {}[{}] succeeded in {}s: {:?}",
                     self.task.name(),
-                    &self.task.request().id,
+                    self.task.request().id,
                     duration.as_secs_f32(),
                     returned
                 );
@@ -106,7 +106,7 @@ where
                         warn!(
                             "Task {}[{}] failed with expected error: {}",
                             self.task.name(),
-                            &self.task.request().id,
+                            self.task.request().id,
                             reason
                         );
                         (true, None)
@@ -115,7 +115,7 @@ where
                         error!(
                             "Task {}[{}] failed with unexpected error: {}",
                             self.task.name(),
-                            &self.task.request().id,
+                            self.task.request().id,
                             reason
                         );
                         (self.task.retry_for_unexpected(), None)
@@ -124,7 +124,7 @@ where
                         error!(
                             "Task {}[{}] timed out after {}s",
                             self.task.name(),
-                            &self.task.request().id,
+                            self.task.request().id,
                             duration.as_secs_f32(),
                         );
                         (true, None)
@@ -133,7 +133,7 @@ where
                         error!(
                             "Task {}[{}] triggered retry",
                             self.task.name(),
-                            &self.task.request().id,
+                            self.task.request().id,
                         );
                         (true, eta)
                     }
@@ -158,14 +158,14 @@ where
                         warn!(
                             "Task {}[{}] retries exceeded",
                             self.task.name(),
-                            &self.task.request().id,
+                            self.task.request().id,
                         );
                         return Err(TraceError::TaskError(e));
                     }
                     info!(
                         "Task {}[{}] retrying ({} / {})",
                         self.task.name(),
-                        &self.task.request().id,
+                        self.task.request().id,
                         retries + 1,
                         max_retries,
                     );
@@ -173,7 +173,7 @@ where
                     info!(
                         "Task {}[{}] retrying ({} / inf)",
                         self.task.name(),
-                        &self.task.request().id,
+                        self.task.request().id,
                         retries + 1,
                     );
                 }
