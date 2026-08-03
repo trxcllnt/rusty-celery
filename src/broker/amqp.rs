@@ -25,6 +25,7 @@ use crate::protocol::{Message, MessageHeaders, MessageProperties, TryDeserialize
 use std::any::Any;
 
 struct Consumer {
+    error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
     wrapped: lapin::Consumer,
 }
 impl DeliveryStream for Consumer {}
@@ -68,8 +69,15 @@ impl Stream for Consumer {
         if let Poll::Ready(ret) = self.wrapped.poll_next(cx) {
             if let Some(result) = ret {
                 match result {
-                    Ok(x) => Poll::Ready(Some(Ok(Box::new(x)))),
-                    Err(x) => Poll::Ready(Some(Err(Box::new(x)))),
+                    Ok(res) => Poll::Ready(Some(Ok(Box::new(res)))),
+                    Err(err) => {
+                        if err.can_be_recovered() {
+                            (self.error_handler)(BrokerError::AMQPError(err));
+                            Poll::Ready(None)
+                        } else {
+                            Poll::Ready(Some(Err(Box::new(err))))
+                        }
+                    }
                 }
             } else {
                 Poll::Ready(None)
@@ -312,17 +320,14 @@ impl Broker for AMQPBroker {
     async fn consume(
         &self,
         queue: &str,
-        _error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
+        error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
     ) -> Result<(String, Box<dyn DeliveryStream>), BrokerError> {
-        // self.conn
-        //     .lock()
-        //     .await
-        //     .on_error(move |e| error_handler(BrokerError::from(e)));
         let queues = self.queues.read().await;
         let queue = queues
             .get(queue)
             .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?;
         let consumer = Consumer {
+            error_handler,
             wrapped: self
                 .consume_channel
                 .read()

@@ -169,12 +169,7 @@ impl BrokerError {
     pub fn is_connection_error(&self) -> bool {
         match self {
             BrokerError::IoError(_) | BrokerError::NotConnected => true,
-            BrokerError::AMQPError(err) => matches!(
-                err.kind(),
-                lapin::ErrorKind::ProtocolError(_)
-                    | lapin::ErrorKind::InvalidConnectionState(_)
-                    | lapin::ErrorKind::InvalidChannelState(_, _)
-            ),
+            BrokerError::AMQPError(err) => err.can_be_recovered(),
             BrokerError::RedisError(err) => {
                 err.is_connection_dropped() || err.is_connection_refusal()
             }
