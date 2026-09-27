@@ -103,7 +103,7 @@ where
             Err(e) => {
                 let (should_retry, retry_eta) = match e {
                     TaskError::ExpectedError(ref reason) => {
-                        warn!(
+                        info!(
                             "Task {}[{}] failed with expected error: {}",
                             self.task.name(),
                             self.task.request().id,
@@ -130,7 +130,7 @@ where
                         (true, None)
                     }
                     TaskError::Retry(eta) => {
-                        error!(
+                        info!(
                             "Task {}[{}] triggered retry",
                             self.task.name(),
                             self.task.request().id,
