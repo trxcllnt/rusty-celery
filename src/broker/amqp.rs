@@ -378,7 +378,7 @@ impl Broker for AMQPBroker {
                 "".into(),
                 queue.into(),
                 BasicPublishOptions::default(),
-                &message.raw_body.clone()[..],
+                &message.raw_body,
                 properties,
             )
             .await?;
