@@ -37,7 +37,9 @@ pub trait Delivery: TryDeserializeMessage + Send + Sync + std::fmt::Debug {
 }
 
 /// The error type of an unsuccessful delivery.
-pub trait DeliveryError: std::fmt::Display + Send + Sync {}
+pub trait DeliveryError: std::fmt::Display + Send + Sync {
+    fn to_broker_error(&self) -> Option<BrokerError>;
+}
 
 /// The stream type that the [`Celery`](crate::Celery) app will consume deliveries from.
 pub trait DeliveryStream:
@@ -192,7 +194,7 @@ pub(crate) async fn build_and_connect(
         match broker_builder.build(connection_timeout).await {
             Err(err) => {
                 if err.is_connection_error() {
-                    error!("{}", err);
+                    error!("Broker connection failed: {err}");
                     error!(
                         "Failed to establish connection with broker, trying again in {}s...",
                         connection_retry_delay

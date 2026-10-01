@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{self, Duration, Instant};
@@ -29,14 +29,14 @@ where
 {
     fn new(task: T, event_tx: UnboundedSender<TaskEvent>) -> Self {
         if let Some(eta) = task.request().eta {
-            info!(
+            debug!(
                 "Task {}[{}] received, ETA: {}",
                 task.name(),
                 task.request().id,
                 eta
             );
         } else {
-            info!("Task {}[{}] received", task.name(), task.request().id);
+            debug!("Task {}[{}] received", task.name(), task.request().id);
         }
 
         Self { task, event_tx }
@@ -63,7 +63,7 @@ where
             .unwrap_or_else(|_| {
                 // This really shouldn't happen. If it does, there's probably much
                 // bigger things to worry about like running out of memory.
-                error!("Failed sending task event");
+                error!("Failed sending task pending event");
             });
 
         let start = Instant::now();
@@ -81,7 +81,7 @@ where
 
         match result {
             Ok(returned) => {
-                info!(
+                debug!(
                     "Task {}[{}] succeeded in {}s: {:?}",
                     self.task.name(),
                     self.task.request().id,
@@ -95,7 +95,7 @@ where
                 self.event_tx
                     .send(TaskEvent::StatusChange(TaskStatus::Finished))
                     .unwrap_or_else(|_| {
-                        error!("Failed sending task event");
+                        error!("Failed sending task finished event");
                     });
 
                 Ok(())
@@ -103,7 +103,7 @@ where
             Err(e) => {
                 let (should_retry, retry_eta) = match e {
                     TaskError::ExpectedError(ref reason) => {
-                        info!(
+                        debug!(
                             "Task {}[{}] failed with expected error: {}",
                             self.task.name(),
                             self.task.request().id,
@@ -112,7 +112,7 @@ where
                         (true, None)
                     }
                     TaskError::UnexpectedError(ref reason) => {
-                        error!(
+                        debug!(
                             "Task {}[{}] failed with unexpected error: {}",
                             self.task.name(),
                             self.task.request().id,
@@ -130,7 +130,7 @@ where
                         (true, None)
                     }
                     TaskError::Retry(eta) => {
-                        info!(
+                        debug!(
                             "Task {}[{}] triggered retry",
                             self.task.name(),
                             self.task.request().id,
@@ -145,7 +145,7 @@ where
                 self.event_tx
                     .send(TaskEvent::StatusChange(TaskStatus::Finished))
                     .unwrap_or_else(|_| {
-                        error!("Failed sending task event");
+                        error!("Failed sending task finished event");
                     });
 
                 if !should_retry {
@@ -155,14 +155,14 @@ where
                 let retries = self.task.request().retries;
                 if let Some(max_retries) = self.task.max_retries() {
                     if retries >= max_retries {
-                        warn!(
+                        debug!(
                             "Task {}[{}] retries exceeded",
                             self.task.name(),
                             self.task.request().id,
                         );
                         return Err(TraceError::TaskError(e));
                     }
-                    info!(
+                    debug!(
                         "Task {}[{}] retrying ({} / {})",
                         self.task.name(),
                         self.task.request().id,
@@ -170,7 +170,7 @@ where
                         max_retries,
                     );
                 } else {
-                    info!(
+                    debug!(
                         "Task {}[{}] retrying ({} / inf)",
                         self.task.name(),
                         self.task.request().id,

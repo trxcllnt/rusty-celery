@@ -29,7 +29,11 @@ struct Consumer {
     wrapped: lapin::Consumer,
 }
 impl DeliveryStream for Consumer {}
-impl DeliveryError for lapin::Error {}
+impl DeliveryError for lapin::Error {
+    fn to_broker_error(&self) -> Option<BrokerError> {
+        Some(BrokerError::AMQPError(self.clone()))
+    }
+}
 
 #[async_trait]
 impl super::Delivery for Delivery {

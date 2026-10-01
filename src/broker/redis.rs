@@ -105,18 +105,18 @@ impl BrokerBuilder for RedisBrokerBuilder {
         for queue_name in &self.config.queues {
             queues.insert(queue_name.into());
         }
-        log::info!("Creating client");
+        log::debug!("Creating client");
         let client = Client::open(&self.config.broker_url[..])
             .map_err(|_| BrokerError::InvalidBrokerUrl(self.config.broker_url.clone()))?;
 
         // let blocking_conn = client.get_connection().unwrap();
 
-        log::info!("Creating tokio manager");
+        log::debug!("Creating tokio manager");
         let manager = client.get_connection_manager().await?;
 
-        log::info!("Creating mpsc channel");
+        log::debug!("Creating mpsc channel");
         let (tx, rx) = channel(1);
-        log::info!("Creating broker");
+        log::debug!("Creating broker");
         Ok(Box::new(RedisBroker {
             uri: self.config.broker_url.clone(),
             queues,

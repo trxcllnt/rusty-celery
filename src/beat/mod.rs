@@ -301,7 +301,7 @@ where
                 match err {
                     BeatError::BrokerError(broker_err) => {
                         if broker_err.is_connection_error() {
-                            error!("Broker connection failed");
+                            error!("Broker connection failed: {broker_err}");
                         } else {
                             return Err(BeatError::BrokerError(broker_err));
                         }

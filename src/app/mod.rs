@@ -428,7 +428,7 @@ impl Celery {
             .await
             .map_err(|e| CeleryError::IoError(e.into()))??;
 
-        info!(
+        debug!(
             "Sending task {}[{}] to {}",
             T::NAME,
             message.task_id(),
@@ -615,17 +615,6 @@ impl Celery {
         Ok(())
     }
 
-    /// Wraps `try_handle_delivery` to catch any and all errors that might occur.
-    async fn handle_delivery(
-        self: Arc<Self>,
-        delivery: Box<dyn Delivery>,
-        event_tx: UnboundedSender<TaskEvent>,
-    ) {
-        if let Err(e) = self.try_handle_delivery(delivery, event_tx).await {
-            error!("{}", e);
-        }
-    }
-
     /// Notify the broker that we correctly processed the message.
     async fn notify_message_processed_successfully(
         &self,
@@ -802,11 +791,35 @@ impl Celery {
                         match delivery_result {
                             Ok(delivery) => {
                                 let task_event_tx = task_event_tx.clone();
-                                debug!("Received delivery from {}: {:?}", queue, delivery);
-                                tokio::spawn(self.clone().handle_delivery(delivery, task_event_tx));
+                                debug!("Received delivery from {queue}: {delivery:?}");
+                                tokio::spawn({
+                                    let app = self.clone();
+                                    let broker_error_tx = broker_error_tx.clone();
+                                    async move {
+                                        if let Err(err) = app.try_handle_delivery(delivery, task_event_tx).await {
+                                            let is_connection_error =
+                                                err.downcast_ref::<CeleryError>().filter(|e| e.is_connection_error()).is_some() ||
+                                                err.downcast_ref::<BrokerError>().filter(|e| e.is_connection_error()).is_some();
+
+                                            if is_connection_error {
+                                                error!("Handle delivery failed due to broker connection error: {err:?}");
+                                                broker_error_tx.try_send(BrokerError::NotConnected).ok();
+                                            } else {
+                                                error!("Handle delivery failed with error: {err}");
+                                            }
+                                        };
+                                    }
+                                });
                             }
-                            Err(e) => {
-                                error!("Deliver failed: {}", e);
+                            Err(err) => {
+                                if let Some(err) = err.to_broker_error() {
+                                    if err.is_connection_error() {
+                                        error!("Received broker connection delivery error: {err}");
+                                        return Err(err.into());
+                                    }
+                                } else {
+                                    error!("Received delivery error: {err}");
+                                }
                             }
                         }
                     }
@@ -820,7 +833,7 @@ impl Celery {
                 },
                 maybe_task_event = task_event_rx.recv() => {
                     if let Some(event) = maybe_task_event {
-                        debug!("Received task event {:?}", event);
+                        debug!("Received task event {event:?}");
                         match event {
                             TaskEvent::StatusChange(TaskStatus::Pending) => pending_tasks += 1,
                             TaskEvent::StatusChange(TaskStatus::Finished) => pending_tasks -= 1,
@@ -828,9 +841,9 @@ impl Celery {
                     }
                 },
                 maybe_broker_error = broker_error_rx.recv() => {
-                    if let Some(broker_error) = maybe_broker_error {
-                        error!("{}", broker_error);
-                        return Err(broker_error.into());
+                    if let Some(err) = maybe_broker_error {
+                        error!("Received broker error: {err}");
+                        return Err(err.into());
                     }
                 }
                 // This branch ensures the loop continues and re-polls the stream_map
@@ -849,7 +862,7 @@ impl Celery {
             // Warm shutdown loop. When there are still pending tasks we wait for them
             // to finish. We get updates about pending tasks through the `task_event_rx` channel.
             // We also watch for a second SIGINT or SIGTERM, in which case we immediately shutdown.
-            info!("Waiting on {} pending tasks...", pending_tasks);
+            info!("Waiting on {pending_tasks} pending tasks...");
             loop {
                 select! {
                     ending = ender.wait() => {

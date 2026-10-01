@@ -39,6 +39,15 @@ pub enum CeleryError {
     ConfigurationError(String),
 }
 
+impl CeleryError {
+    pub fn is_connection_error(&self) -> bool {
+        match self {
+            CeleryError::BrokerError(err) => err.is_connection_error(),
+            _ => false,
+        }
+    }
+}
+
 /// Errors that can occur while creating or using a `Beat` app.
 #[derive(Error, Debug)]
 pub enum BeatError {

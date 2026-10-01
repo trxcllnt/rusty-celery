@@ -1,6 +1,6 @@
 use super::{scheduled_task::ScheduledTask, Schedule};
 use crate::{broker::Broker, error::BeatError, protocol::TryCreateMessage};
-use log::{debug, info};
+use log::debug;
 use std::collections::BinaryHeap;
 use std::time::{Duration, SystemTime};
 
@@ -116,7 +116,7 @@ impl Scheduler {
 
         let message = scheduled_task.message_factory.try_create_message()?;
 
-        info!(
+        debug!(
             "Sending task {}[{}] to {} queue",
             scheduled_task.name,
             message.task_id(),
