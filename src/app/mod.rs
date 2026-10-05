@@ -19,8 +19,7 @@ use tokio_stream::StreamMap;
 mod trace;
 
 use crate::broker::{
-    broker_builder_from_url, build_and_connect, configure_task_routes, Broker, BrokerBuilder,
-    Delivery,
+    broker_builder_from_url, configure_task_routes, Broker, BrokerBuilder, Delivery,
 };
 use crate::error::{BrokerError, CeleryError, TraceError};
 use crate::protocol::{Message, MessageContentType};
@@ -252,17 +251,21 @@ impl CeleryBuilder {
         let (broker_builder, task_routes) =
             configure_task_routes(broker_builder, &self.config.task_routes)?;
 
-        let broker = build_and_connect(
-            broker_builder,
-            self.config.broker_connection_timeout,
-            if self.config.broker_connection_retry {
-                self.config.broker_connection_max_retries
-            } else {
-                0
-            },
-            self.config.broker_connection_retry_delay,
-        )
-        .await?;
+        let broker = broker_builder
+            .build(
+                self.config.broker_connection_timeout,
+                if self.config.broker_connection_retry {
+                    self.config.broker_connection_max_retries
+                } else {
+                    0
+                },
+                self.config.broker_connection_retry_delay,
+            )
+            .await
+            .map_err(|err| {
+                error!("Failed to establish connection with broker: {err:#}");
+                BrokerError::NotConnected
+            })?;
 
         Ok(Celery {
             name: self.config.name,
@@ -689,24 +692,13 @@ impl Celery {
     /// Consume tasks from any number of queues.
     pub async fn consume_from(self: &Arc<Self>, queues: &[&str]) -> Result<(), CeleryError> {
         loop {
-            let result = self.clone()._consume_from(queues).await;
-            if !self.broker_connection_retry {
-                return result;
-            }
-
-            if let Err(err) = result {
-                match err {
-                    CeleryError::BrokerError(broker_err) => {
-                        if broker_err.is_connection_error() {
-                            error!("Broker connection failed");
-                        } else {
-                            return Err(CeleryError::BrokerError(broker_err));
-                        }
-                    }
-                    _ => return Err(err),
-                };
-            } else {
-                return result;
+            match self.clone()._consume_from(queues).await {
+                Err(CeleryError::BrokerError(err))
+                    if self.broker_connection_retry && err.is_connection_error() =>
+                {
+                    error!("Broker connection failed: {err:#}");
+                }
+                res => return res,
             }
 
             let mut reconnect_successful: bool = false;
@@ -720,6 +712,11 @@ impl Celery {
                 match self.broker.reconnect(self.broker_connection_timeout).await {
                     Err(err) => {
                         if err.is_connection_error() {
+                            error!("Broker connection failed: {err}");
+                            error!(
+                                "Failed to establish connection with broker, trying again in {}s...",
+                                self.broker_connection_retry_delay
+                            );
                             continue;
                         }
                         return Err(CeleryError::BrokerError(err));

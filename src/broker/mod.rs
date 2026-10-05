@@ -4,8 +4,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::Stream;
-use log::error;
-use tokio::time::{self, Duration};
 
 use crate::error::BrokerError;
 use crate::{
@@ -145,7 +143,12 @@ pub trait BrokerBuilder: Send + Sync {
     ) -> Box<dyn BrokerBuilder>;
 
     /// Construct the `Broker` with the given configuration.
-    async fn build(&self, connection_timeout: u32) -> Result<Box<dyn Broker>, BrokerError>;
+    async fn build(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<Box<dyn Broker>, BrokerError>;
 }
 
 pub(crate) fn broker_builder_from_url(broker_url: &str) -> Box<dyn BrokerBuilder> {
@@ -180,39 +183,39 @@ pub(crate) fn configure_task_routes(
     Ok((broker_builder, rules))
 }
 
-/// A utility function that can be used to build a broker
-/// and initialize the connection.
-pub(crate) async fn build_and_connect(
-    broker_builder: Box<dyn BrokerBuilder>,
-    connection_timeout: u32,
-    connection_max_retries: u32,
-    connection_retry_delay: u32,
-) -> Result<Box<dyn Broker>, BrokerError> {
-    let mut broker: Option<Box<dyn Broker>> = None;
+// /// A utility function that can be used to build a broker
+// /// and initialize the connection.
+// pub(crate) async fn build_and_connect(
+//     broker_builder: Box<dyn BrokerBuilder>,
+//     connection_timeout: u32,
+//     connection_max_retries: u32,
+//     connection_retry_delay: u32,
+// ) -> Result<Box<dyn Broker>, BrokerError> {
+//     let mut broker: Option<Box<dyn Broker>> = None;
 
-    for _ in 0..connection_max_retries {
-        match broker_builder.build(connection_timeout).await {
-            Err(err) => {
-                if err.is_connection_error() {
-                    error!("Broker connection failed: {err}");
-                    error!(
-                        "Failed to establish connection with broker, trying again in {}s...",
-                        connection_retry_delay
-                    );
-                    time::sleep(Duration::from_secs(connection_retry_delay as u64)).await;
-                    continue;
-                }
-                return Err(err);
-            }
-            Ok(b) => {
-                broker = Some(b);
-                break;
-            }
-        };
-    }
+//     for _ in 0..connection_max_retries.max(1) {
+//         match broker_builder.build(connection_timeout).await {
+//             Err(err) => {
+//                 if err.is_connection_error() {
+//                     error!("Broker connection failed: {err}");
+//                     error!(
+//                         "Failed to establish connection with broker, trying again in {}s...",
+//                         connection_retry_delay
+//                     );
+//                     time::sleep(Duration::from_secs(connection_retry_delay as u64)).await;
+//                     continue;
+//                 }
+//                 return Err(err);
+//             }
+//             Ok(b) => {
+//                 broker = Some(b);
+//                 break;
+//             }
+//         };
+//     }
 
-    broker.ok_or_else(|| {
-        error!("Failed to establish connection with broker");
-        BrokerError::NotConnected
-    })
-}
+//     broker.ok_or_else(|| {
+//         error!("Failed to establish connection with broker");
+//         BrokerError::NotConnected
+//     })
+// }

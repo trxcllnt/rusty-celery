@@ -20,6 +20,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::{Poll, Waker};
+use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -100,7 +101,12 @@ impl BrokerBuilder for RedisBrokerBuilder {
     }
 
     /// Construct the `Broker` with the given configuration.
-    async fn build(&self, _connection_timeout: u32) -> Result<Box<dyn Broker>, BrokerError> {
+    async fn build(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<Box<dyn Broker>, BrokerError> {
         let mut queues: HashSet<String> = HashSet::new();
         for queue_name in &self.config.queues {
             queues.insert(queue_name.into());
@@ -109,10 +115,35 @@ impl BrokerBuilder for RedisBrokerBuilder {
         let client = Client::open(&self.config.broker_url[..])
             .map_err(|_| BrokerError::InvalidBrokerUrl(self.config.broker_url.clone()))?;
 
-        // let blocking_conn = client.get_connection().unwrap();
-
         log::debug!("Creating tokio manager");
-        let manager = client.get_connection_manager().await?;
+        let connection_timeout = Duration::from_secs(connection_timeout as u64);
+        let connection_retry_delay = Duration::from_secs(connection_retry_delay as u64);
+
+        let mut connection_attempts = 0;
+        let connection_max_retries = connection_max_retries.max(1);
+
+        let manager = loop {
+            let err =
+                match tokio::time::timeout(connection_timeout, client.get_connection_manager())
+                    .await
+                {
+                    Ok(Ok(res)) => break res,
+                    Err(err) => format!("{err:#}"),
+                    Ok(Err(err)) => format!("{err:#}"),
+                };
+            if connection_attempts < connection_max_retries.max(1) {
+                connection_attempts += 1;
+                error!("Broker connection failed: {err}");
+                error!(
+                    "Failed to establish connection with broker, trying again in {connection_retry_delay:?}..."
+                );
+                tokio::time::sleep(connection_retry_delay).await;
+                continue;
+            } else {
+                error!("Failed to establish connection with broker");
+                return Err(BrokerError::NotConnected);
+            }
+        };
 
         log::debug!("Creating mpsc channel");
         let (tx, rx) = channel(1);

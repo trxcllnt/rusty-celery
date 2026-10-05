@@ -64,7 +64,12 @@ impl BrokerBuilder for MockBrokerBuilder {
     }
 
     #[allow(unused)]
-    async fn build(&self, connection_timeout: u32) -> Result<Box<dyn Broker>, BrokerError> {
+    async fn build(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<Box<dyn Broker>, BrokerError> {
         Ok(Box::new(MockBroker::new()))
     }
 }

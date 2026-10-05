@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
-use futures::Stream;
+use futures::{FutureExt, Stream};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicNackOptions,
@@ -11,10 +11,14 @@ use lapin::options::{
 use lapin::types::{AMQPValue, FieldArray, FieldTable};
 use lapin::uri::{self, AMQPUri};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Queue};
-use log::debug;
+use log::{debug, warn};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
 use super::{Broker, BrokerBuilder, DeliveryError, DeliveryStream};
@@ -24,11 +28,15 @@ use crate::protocol::{Message, MessageHeaders, MessageProperties, TryDeserialize
 #[cfg(test)]
 use std::any::Any;
 
-struct Consumer {
-    error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
-    wrapped: lapin::Consumer,
+struct Consumer<F>
+where
+    F: Future<Output = Result<(), lapin::Error>>,
+{
+    error_handler: Box<dyn Fn(lapin::Error) -> F + Send + Sync + 'static>,
+    recover_fut: Option<Pin<Box<F>>>,
+    consumer: lapin::Consumer,
 }
-impl DeliveryStream for Consumer {}
+impl<F> DeliveryStream for Consumer<F> where F: Future<Output = Result<(), lapin::Error>> {}
 impl DeliveryError for lapin::Error {
     fn to_broker_error(&self) -> Option<BrokerError> {
         Some(BrokerError::AMQPError(self.clone()))
@@ -61,7 +69,10 @@ impl super::Delivery for Delivery {
     }
 }
 
-impl Stream for Consumer {
+impl<F> Stream for Consumer<F>
+where
+    F: Future<Output = Result<(), lapin::Error>>,
+{
     type Item = Result<Box<dyn super::Delivery>, Box<dyn DeliveryError>>;
 
     fn poll_next(
@@ -70,17 +81,27 @@ impl Stream for Consumer {
     ) -> std::task::Poll<std::option::Option<<Self as futures::Stream>::Item>> {
         use futures_lite::stream::StreamExt;
 
-        if let Poll::Ready(ret) = self.wrapped.poll_next(cx) {
+        if let Some(mut recover_fut) = self.recover_fut.take() {
+            match recover_fut.poll_unpin(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(Some(Err(Box::new(err))));
+                }
+                Poll::Pending => {
+                    self.recover_fut.replace(recover_fut);
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        if let Poll::Ready(ret) = self.consumer.poll_next(cx) {
             if let Some(result) = ret {
                 match result {
                     Ok(res) => Poll::Ready(Some(Ok(Box::new(res)))),
                     Err(err) => {
-                        if err.can_be_recovered() {
-                            (self.error_handler)(BrokerError::AMQPError(err));
-                            Poll::Ready(None)
-                        } else {
-                            Poll::Ready(Some(Err(Box::new(err))))
-                        }
+                        let error_fut = (self.error_handler)(err);
+                        self.recover_fut.replace(Box::pin(error_fut));
+                        Poll::Ready(None)
                     }
                 }
             } else {
@@ -220,15 +241,31 @@ impl BrokerBuilder for AMQPBrokerBuilder {
     }
 
     /// Build an `AMQPBroker`.
-    async fn build(&self, connection_timeout: u32) -> Result<Box<dyn Broker>, BrokerError> {
+    async fn build(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<Box<dyn Broker>, BrokerError> {
         let mut uri = AMQPUri::from_str(&self.config.broker_url)
             .map_err(|_| BrokerError::InvalidBrokerUrl(self.config.broker_url.clone()))?;
         uri.query.heartbeat = self.config.heartbeat;
         uri.query.connection_timeout = Some((connection_timeout as u64) * 1000);
 
+        let mut connection_properties = ConnectionProperties::default();
+        if connection_max_retries > 0 {
+            connection_properties = connection_properties
+                .configure_backoff(|backoff| {
+                    backoff
+                        .with_max_times(connection_max_retries as usize)
+                        .with_max_delay(Duration::from_secs(connection_retry_delay as u64))
+                })
+                .enable_auto_recover();
+        }
+
         let conn = Connection::connect_uri_with_runtime(
             uri.clone(),
-            ConnectionProperties::default(),
+            connection_properties,
             async_rs::Runtime::tokio_current(),
         )
         .await?;
@@ -251,8 +288,8 @@ impl BrokerBuilder for AMQPBrokerBuilder {
         let broker = AMQPBroker {
             uri,
             conn: Mutex::new(conn),
-            consume_channel: RwLock::new(consume_channel),
-            produce_channel: RwLock::new(produce_channel),
+            consume_channel: Arc::new(RwLock::new(consume_channel)),
+            produce_channel: Arc::new(RwLock::new(produce_channel)),
             queues: RwLock::new(queues),
             queue_declare_options: self.config.queues.clone(),
             prefetch_count: Mutex::new(self.config.prefetch_count),
@@ -274,12 +311,12 @@ pub struct AMQPBroker {
     conn: Mutex<Connection>,
 
     /// Channel to consume messages from.
-    consume_channel: RwLock<Channel>,
+    consume_channel: Arc<RwLock<Channel>>,
 
     /// Channel to produce messages from.
     ///
     /// This is only wrapped in RwLock for interior mutability.
-    produce_channel: RwLock<Channel>,
+    produce_channel: Arc<RwLock<Channel>>,
 
     /// Mapping of queue name to Queue struct.
     ///
@@ -295,12 +332,19 @@ pub struct AMQPBroker {
 
 impl AMQPBroker {
     async fn set_prefetch_count(&self, prefetch_count: u16) -> Result<(), BrokerError> {
-        debug!("Setting prefetch count to {}", prefetch_count);
-        self.consume_channel
-            .read()
-            .await
-            .basic_qos(prefetch_count, BasicQosOptions { global: true })
-            .await?;
+        debug!("Setting prefetch count to {prefetch_count}");
+        loop {
+            let channel = self.consume_channel.read().await;
+            if let Err(err) = channel
+                .basic_qos(prefetch_count, BasicQosOptions { global: true })
+                .await
+            {
+                warn!("basic_qos error: {err:#}");
+                channel.wait_for_recovery(err).await?;
+            } else {
+                break;
+            }
+        }
         Ok(())
     }
 }
@@ -324,34 +368,67 @@ impl Broker for AMQPBroker {
     async fn consume(
         &self,
         queue: &str,
-        error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
+        _error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
     ) -> Result<(String, Box<dyn DeliveryStream>), BrokerError> {
-        let queues = self.queues.read().await;
-        let queue = queues
+        let queue = self
+            .queues
+            .read()
+            .await
             .get(queue)
-            .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?;
-        let consumer = Consumer {
-            error_handler,
-            wrapped: self
-                .consume_channel
-                .read()
-                .await
+            .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?
+            .name()
+            .clone();
+
+        let consumer = loop {
+            let channel = self.consume_channel.read().await;
+            match channel
                 .basic_consume(
-                    queue.name().as_str().into(),
+                    queue.clone(),
                     "".into(),
                     BasicConsumeOptions::default(),
                     FieldTable::default(),
                 )
-                .await?,
+                .await
+            {
+                Ok(consumer) => break consumer,
+                Err(err) => {
+                    warn!("basic_consume error: {err:#}");
+                    channel.wait_for_recovery(err).await?;
+                }
+            }
         };
-        Ok((consumer.wrapped.tag().to_string(), Box::new(consumer)))
+
+        let channel = self.consume_channel.clone();
+
+        Ok((
+            consumer.tag().to_string(),
+            Box::new(Consumer {
+                consumer,
+                recover_fut: None,
+                error_handler: Box::new(move |err| {
+                    let channel = channel.clone();
+                    async move {
+                        warn!("consumer error: {err:#}");
+                        channel.write().await.wait_for_recovery(err).await
+                    }
+                }),
+            }),
+        ))
     }
 
     async fn cancel(&self, consumer_tag: &str) -> Result<(), BrokerError> {
-        let consume_channel = self.consume_channel.write().await;
-        consume_channel
-            .basic_cancel(consumer_tag.into(), BasicCancelOptions::default())
-            .await?;
+        loop {
+            let channel = self.consume_channel.write().await;
+            if let Err(err) = channel
+                .basic_cancel(consumer_tag.into(), BasicCancelOptions::default())
+                .await
+            {
+                warn!("basic_cancel error: {err:#}");
+                channel.wait_for_recovery(err).await?;
+            } else {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -375,17 +452,24 @@ impl Broker for AMQPBroker {
     async fn send(&self, message: &Message, queue: &str) -> Result<(), BrokerError> {
         let properties = message.delivery_properties();
         debug!("Sending AMQP message with: {:?}", properties);
-        self.produce_channel
-            .read()
-            .await
-            .basic_publish(
-                "".into(),
-                queue.into(),
-                BasicPublishOptions::default(),
-                &message.raw_body,
-                properties,
-            )
-            .await?;
+        loop {
+            let channel = self.produce_channel.read().await;
+            if let Err(err) = channel
+                .basic_publish(
+                    "".into(),
+                    queue.into(),
+                    BasicPublishOptions::default(),
+                    &message.raw_body,
+                    properties.clone(),
+                )
+                .await
+            {
+                warn!("basic_publish error: {err:#}");
+                channel.wait_for_recovery(err).await?;
+            } else {
+                break;
+            }
+        }
         Ok(())
     }
 
