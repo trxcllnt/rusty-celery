@@ -529,15 +529,32 @@ impl Broker for AMQPBroker {
     }
 
     /// Try reconnecting in the event of some sort of connection error.
-    async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError> {
+    async fn reconnect(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<(), BrokerError> {
         let mut conn = self.conn.lock().await;
         if !conn.status().connected() {
             debug!("Attempting to reconnect to broker");
             let mut uri = self.uri.clone();
             uri.query.connection_timeout = Some(connection_timeout as u64);
+
+            let mut connection_properties = ConnectionProperties::default();
+            if connection_max_retries > 0 {
+                connection_properties = connection_properties
+                    .configure_backoff(|backoff| {
+                        backoff
+                            .with_max_times(connection_max_retries as usize)
+                            .with_max_delay(Duration::from_secs(connection_retry_delay as u64))
+                    })
+                    .enable_auto_recover();
+            }
+
             *conn = Connection::connect_uri_with_runtime(
                 uri,
-                ConnectionProperties::default(),
+                connection_properties,
                 async_rs::Runtime::tokio_current(),
             )
             .await?;

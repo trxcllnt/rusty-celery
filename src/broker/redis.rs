@@ -471,39 +471,50 @@ impl Broker for RedisBroker {
         }
     }
 
-    async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError> {
+    async fn reconnect(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<(), BrokerError> {
+        let connection_timeout = Duration::from_secs(connection_timeout as u64);
+        let connection_retry_delay = Duration::from_secs(connection_retry_delay as u64);
         // Stop additional task fetching
         let old_prefetch_count = self.prefetch_count.fetch_and(0, Ordering::SeqCst);
+
+        let mut connection_attempts = 0;
         let mut conn = self.manager.clone();
-        let timed_out = false;
         loop {
-            let rez: Result<String, RedisError> = redis::cmd("PING").query_async(&mut conn).await;
-            match rez {
-                Ok(rez) => {
-                    if rez.eq("PONG") {
+            if connection_attempts < connection_max_retries {
+                error!(
+                    "Failed to establish connection with broker, trying again in {connection_retry_delay:?}..."
+                );
+                tokio::time::sleep(connection_retry_delay).await;
+
+                connection_attempts += 1;
+                let err = match tokio::time::timeout(
+                    connection_timeout,
+                    redis::cmd("PING").query_async::<String>(&mut conn),
+                )
+                .await
+                {
+                    Ok(Ok(res)) if res.eq("PONG") => {
                         self.prefetch_count
                             .store(old_prefetch_count, Ordering::SeqCst);
                         return Ok(());
-                    } else {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(
-                            connection_timeout as u64,
-                        ))
-                        .await;
-                        continue;
                     }
-                }
-                Err(e) => {
-                    if !timed_out {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(
-                            connection_timeout as u64,
-                        ))
-                        .await;
-                        continue;
-                    }
-                    self.prefetch_count
-                        .store(old_prefetch_count, Ordering::SeqCst);
-                    return Err(e.into());
-                }
+                    Err(err) => format!("{err:#}"),
+                    Ok(Ok(err)) => format!("{err:#}"),
+                    Ok(Err(err)) => format!("{err:#}"),
+                };
+                error!("Broker connection failed: {err}");
+                continue;
+            } else {
+                self.prefetch_count
+                    .store(old_prefetch_count, Ordering::SeqCst);
+
+                error!("Failed to establish connection with broker");
+                return Err(BrokerError::NotConnected);
             }
         }
     }

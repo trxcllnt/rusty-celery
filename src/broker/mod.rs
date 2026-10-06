@@ -97,7 +97,12 @@ pub trait Broker: Send + Sync {
     async fn close(&self) -> Result<(), BrokerError>;
 
     /// Try reconnecting in the event of some sort of connection error.
-    async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError>;
+    async fn reconnect(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<(), BrokerError>;
 
     /// Indicates that a message has been processed.
     async fn on_message_processed(&self, _delivery: &dyn Delivery) -> Result<(), BrokerError> {

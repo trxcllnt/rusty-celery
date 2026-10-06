@@ -325,7 +325,11 @@ where
                 match self
                     .scheduler
                     .broker
-                    .reconnect(self.broker_connection_timeout)
+                    .reconnect(
+                        self.broker_connection_timeout,
+                        self.broker_connection_max_retries,
+                        self.broker_connection_retry_delay,
+                    )
                     .await
                 {
                     Err(err) => {

@@ -153,7 +153,12 @@ impl Broker for MockBroker {
     }
 
     #[allow(unused)]
-    async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError> {
+    async fn reconnect(
+        &self,
+        connection_timeout: u32,
+        connection_max_retries: u32,
+        connection_retry_delay: u32,
+    ) -> Result<(), BrokerError> {
         Ok(())
     }
 

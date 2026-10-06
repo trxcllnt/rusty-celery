@@ -98,7 +98,7 @@ async fn test_redis_broker() -> Result<()> {
     let res = my_app.send_task(add::new(1, 2)).await;
     assert!(res.is_err());
     println!("reconnect");
-    my_app.broker.reconnect(5).await.unwrap();
+    my_app.broker.reconnect(5, 0, 0).await.unwrap();
 
     // Send another task to the queue.
     let send_result = my_app.send_task(add::new(2, 2)).await;

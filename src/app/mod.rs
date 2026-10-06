@@ -709,7 +709,15 @@ impl Celery {
                 ))
                 .await;
 
-                match self.broker.reconnect(self.broker_connection_timeout).await {
+                match self
+                    .broker
+                    .reconnect(
+                        self.broker_connection_timeout,
+                        self.broker_connection_max_retries,
+                        self.broker_connection_retry_delay,
+                    )
+                    .await
+                {
                     Err(err) => {
                         if err.is_connection_error() {
                             error!("Broker connection failed: {err}");
