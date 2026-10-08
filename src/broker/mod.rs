@@ -93,7 +93,7 @@ pub trait Broker: Send + Sync {
     /// ETA is executed.
     async fn decrease_prefetch_count(&self) -> Result<(), BrokerError>;
 
-    /// Clone all channels and connection.
+    /// Close all channels and connection.
     async fn close(&self) -> Result<(), BrokerError>;
 
     /// Try reconnecting in the event of some sort of connection error.
@@ -187,40 +187,3 @@ pub(crate) fn configure_task_routes(
 
     Ok((broker_builder, rules))
 }
-
-// /// A utility function that can be used to build a broker
-// /// and initialize the connection.
-// pub(crate) async fn build_and_connect(
-//     broker_builder: Box<dyn BrokerBuilder>,
-//     connection_timeout: u32,
-//     connection_max_retries: u32,
-//     connection_retry_delay: u32,
-// ) -> Result<Box<dyn Broker>, BrokerError> {
-//     let mut broker: Option<Box<dyn Broker>> = None;
-
-//     for _ in 0..connection_max_retries.max(1) {
-//         match broker_builder.build(connection_timeout).await {
-//             Err(err) => {
-//                 if err.is_connection_error() {
-//                     error!("Broker connection failed: {err}");
-//                     error!(
-//                         "Failed to establish connection with broker, trying again in {}s...",
-//                         connection_retry_delay
-//                     );
-//                     time::sleep(Duration::from_secs(connection_retry_delay as u64)).await;
-//                     continue;
-//                 }
-//                 return Err(err);
-//             }
-//             Ok(b) => {
-//                 broker = Some(b);
-//                 break;
-//             }
-//         };
-//     }
-
-//     broker.ok_or_else(|| {
-//         error!("Failed to establish connection with broker");
-//         BrokerError::NotConnected
-//     })
-// }

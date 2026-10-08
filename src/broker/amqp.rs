@@ -6,20 +6,19 @@ use futures::{FutureExt, Stream};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicNackOptions,
-    BasicPublishOptions, BasicQosOptions, QueueDeclareOptions,
+    BasicPublishOptions, BasicQosOptions, ConfirmSelectOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldArray, FieldTable};
 use lapin::uri::{self, AMQPUri};
-use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Queue};
+use lapin::{BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Queue};
 use log::{debug, warn};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 use super::{Broker, BrokerBuilder, DeliveryError, DeliveryStream};
 use crate::error::{BrokerError, ProtocolError};
@@ -252,13 +251,17 @@ impl BrokerBuilder for AMQPBrokerBuilder {
         uri.query.heartbeat = self.config.heartbeat;
         uri.query.connection_timeout = Some((connection_timeout as u64) * 1000);
 
+        let connection_max_retries = connection_max_retries as usize;
+        let connection_timeout = Duration::from_secs(connection_timeout as u64);
+        let connection_retry_delay = Duration::from_secs(connection_retry_delay as u64);
+
         let mut connection_properties = ConnectionProperties::default();
         if connection_max_retries > 0 {
             connection_properties = connection_properties
                 .configure_backoff(|backoff| {
                     backoff
-                        .with_max_times(connection_max_retries as usize)
-                        .with_max_delay(Duration::from_secs(connection_retry_delay as u64))
+                        .with_max_times(connection_max_retries)
+                        .with_max_delay(connection_retry_delay)
                 })
                 .enable_auto_recover();
         }
@@ -272,6 +275,10 @@ impl BrokerBuilder for AMQPBrokerBuilder {
 
         let consume_channel = conn.create_channel().await?;
         let produce_channel = conn.create_channel().await?;
+
+        produce_channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await?;
 
         let mut queues: HashMap<String, Queue> = HashMap::new();
         for (queue_name, queue_config) in &self.config.queues {
@@ -287,12 +294,13 @@ impl BrokerBuilder for AMQPBrokerBuilder {
 
         let broker = AMQPBroker {
             uri,
-            conn: Mutex::new(conn),
-            consume_channel: Arc::new(RwLock::new(consume_channel)),
-            produce_channel: Arc::new(RwLock::new(produce_channel)),
-            queues: RwLock::new(queues),
-            queue_declare_options: self.config.queues.clone(),
+            conn,
+            consume_channel,
+            produce_channel,
+            queues,
+            // queue_declare_options: self.config.queues.clone(),
             prefetch_count: Mutex::new(self.config.prefetch_count),
+            recovery_timeout: connection_timeout,
         };
         broker
             .set_prefetch_count(self.config.prefetch_count)
@@ -306,46 +314,35 @@ pub struct AMQPBroker {
     uri: AMQPUri,
 
     /// Broker connection.
-    ///
-    /// This is only wrapped in a Mutex for interior mutability.
-    conn: Mutex<Connection>,
+    conn: Connection,
 
     /// Channel to consume messages from.
-    consume_channel: Arc<RwLock<Channel>>,
+    consume_channel: Channel,
 
     /// Channel to produce messages from.
-    ///
-    /// This is only wrapped in RwLock for interior mutability.
-    produce_channel: Arc<RwLock<Channel>>,
+    produce_channel: Channel,
 
     /// Mapping of queue name to Queue struct.
-    ///
-    /// This is only wrapped in RwLock for interior mutability.
-    queues: RwLock<HashMap<String, Queue>>,
+    queues: HashMap<String, Queue>,
 
-    queue_declare_options: HashMap<String, QueueConfig>,
-
+    // queue_declare_options: HashMap<String, QueueConfig>,
     /// Need to keep track of prefetch count. We put this behind a mutex to get interior
     /// mutability.
     prefetch_count: Mutex<u16>,
+
+    /// Timeout to wait for error recovery. The same as the Builder's connection timeout.
+    recovery_timeout: Duration,
 }
 
 impl AMQPBroker {
     async fn set_prefetch_count(&self, prefetch_count: u16) -> Result<(), BrokerError> {
         debug!("Setting prefetch count to {prefetch_count}");
-        loop {
-            let channel = self.consume_channel.read().await;
-            if let Err(err) = channel
-                .basic_qos(prefetch_count, BasicQosOptions { global: true })
-                .await
-            {
-                warn!("basic_qos error: {err:#}");
-                channel.wait_for_recovery(err).await?;
-            } else {
-                break;
-            }
-        }
-        Ok(())
+        basic_qos_with_timeout_and_recovery(
+            prefetch_count,
+            &self.consume_channel,
+            self.recovery_timeout,
+        )
+        .await
     }
 }
 
@@ -372,64 +369,56 @@ impl Broker for AMQPBroker {
     ) -> Result<(String, Box<dyn DeliveryStream>), BrokerError> {
         let queue = self
             .queues
-            .read()
-            .await
             .get(queue)
             .ok_or_else::<BrokerError, _>(|| BrokerError::UnknownQueue(queue.into()))?
-            .name()
-            .clone();
+            .name();
 
-        let consumer = loop {
-            let channel = self.consume_channel.read().await;
-            match channel
-                .basic_consume(
-                    queue.clone(),
-                    "".into(),
-                    BasicConsumeOptions::default(),
-                    FieldTable::default(),
-                )
-                .await
-            {
-                Ok(consumer) => break consumer,
-                Err(err) => {
-                    warn!("basic_consume error: {err:#}");
-                    channel.wait_for_recovery(err).await?;
-                }
-            }
-        };
-
-        let channel = self.consume_channel.clone();
+        let consumer = basic_consume_with_timeout_and_recovery(
+            queue.as_str(),
+            "",
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+            &self.consume_channel,
+            self.recovery_timeout,
+        )
+        .await?;
 
         Ok((
             consumer.tag().to_string(),
             Box::new(Consumer {
                 consumer,
                 recover_fut: None,
-                error_handler: Box::new(move |err| {
-                    let channel = channel.clone();
-                    async move {
-                        warn!("consumer error: {err:#}");
-                        channel.write().await.wait_for_recovery(err).await
-                    }
-                }),
+                error_handler: {
+                    let channel = self.consume_channel.clone();
+                    let timeout = self.recovery_timeout;
+                    Box::new(move |error| {
+                        let channel = channel.clone();
+                        async move {
+                            warn!("consumer error: {error:#}");
+                            match tokio::time::timeout(
+                                timeout,
+                                channel.wait_for_recovery(error.clone()),
+                            )
+                            .await
+                            {
+                                Err(_) => Err(error),
+                                Ok(Ok(res)) => Ok(res),
+                                Ok(Err(err)) => Err(err),
+                            }
+                        }
+                    })
+                },
             }),
         ))
     }
 
     async fn cancel(&self, consumer_tag: &str) -> Result<(), BrokerError> {
-        loop {
-            let channel = self.consume_channel.write().await;
-            if let Err(err) = channel
-                .basic_cancel(consumer_tag.into(), BasicCancelOptions::default())
-                .await
-            {
-                warn!("basic_cancel error: {err:#}");
-                channel.wait_for_recovery(err).await?;
-            } else {
-                break;
-            }
-        }
-        Ok(())
+        basic_cancel_with_timeout_and_recovery(
+            consumer_tag,
+            &self.consume_channel,
+            self.recovery_timeout,
+        )
+        .await
     }
 
     async fn ack(&self, delivery: &dyn super::Delivery) -> Result<(), BrokerError> {
@@ -451,26 +440,17 @@ impl Broker for AMQPBroker {
 
     async fn send(&self, message: &Message, queue: &str) -> Result<(), BrokerError> {
         let properties = message.delivery_properties();
-        debug!("Sending AMQP message with: {:?}", properties);
-        loop {
-            let channel = self.produce_channel.read().await;
-            if let Err(err) = channel
-                .basic_publish(
-                    "".into(),
-                    queue.into(),
-                    BasicPublishOptions::default(),
-                    &message.raw_body,
-                    properties.clone(),
-                )
-                .await
-            {
-                warn!("basic_publish error: {err:#}");
-                channel.wait_for_recovery(err).await?;
-            } else {
-                break;
-            }
-        }
-        Ok(())
+        debug!("Sending AMQP message with: {properties:?}");
+        basic_publish_with_timeout_and_recovery(
+            "",
+            queue,
+            BasicPublishOptions::default(),
+            &message.raw_body,
+            properties,
+            &self.produce_channel,
+            self.recovery_timeout,
+        )
+        .await
     }
 
     async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
@@ -506,23 +486,19 @@ impl Broker for AMQPBroker {
     }
 
     async fn close(&self) -> Result<(), BrokerError> {
-        let consume_channel = self.consume_channel.write().await;
-        let produce_channel = self.produce_channel.write().await;
-        let conn = self.conn.lock().await;
-
-        if consume_channel.status().connected() {
+        if self.consume_channel.status().connected() {
             debug!("Closing consumer channel...");
-            consume_channel.close(200, "OK".into()).await?;
+            self.consume_channel.close(200, "OK".into()).await?;
         }
 
-        if produce_channel.status().connected() {
+        if self.produce_channel.status().connected() {
             debug!("Closing producer channel...");
-            produce_channel.close(200, "OK".into()).await?;
+            self.produce_channel.close(200, "OK".into()).await?;
         }
 
-        if conn.status().connected() {
+        if self.conn.status().connected() {
             debug!("Closing connection...");
-            conn.close(200, "OK".into()).await?;
+            self.conn.close(200, "OK".into()).await?;
         }
 
         Ok(())
@@ -535,56 +511,205 @@ impl Broker for AMQPBroker {
         connection_max_retries: u32,
         connection_retry_delay: u32,
     ) -> Result<(), BrokerError> {
-        let mut conn = self.conn.lock().await;
-        if !conn.status().connected() {
-            debug!("Attempting to reconnect to broker");
-            let mut uri = self.uri.clone();
-            uri.query.connection_timeout = Some(connection_timeout as u64);
+        let connection_timeout = Duration::from_secs(connection_timeout as u64);
+        let connection_retry_delay = Duration::from_secs(connection_retry_delay as u64);
 
-            let mut connection_properties = ConnectionProperties::default();
-            if connection_max_retries > 0 {
-                connection_properties = connection_properties
-                    .configure_backoff(|backoff| {
-                        backoff
-                            .with_max_times(connection_max_retries as usize)
-                            .with_max_delay(Duration::from_secs(connection_retry_delay as u64))
-                    })
-                    .enable_auto_recover();
+        match tokio::time::timeout(connection_timeout * connection_max_retries, async {
+            let mut connection_attempts = 0;
+            loop {
+                let status = self.conn.status();
+                if status.connected() {
+                    break Ok(());
+                }
+                if connection_attempts < connection_max_retries {
+                    connection_attempts += 1;
+                    if status.reconnecting() {
+                        warn!(
+                            "Failed to establish connection with broker, trying again in {connection_retry_delay:?}..."
+                        );
+                        tokio::time::sleep(connection_retry_delay).await;
+                        continue;
+                    }
+                }
+                break Err(BrokerError::NotConnected);
             }
-
-            *conn = Connection::connect_uri_with_runtime(
-                uri,
-                connection_properties,
-                async_rs::Runtime::tokio_current(),
-            )
-            .await?;
-
-            let mut consume_channel = self.consume_channel.write().await;
-            let mut produce_channel = self.produce_channel.write().await;
-            let mut queues = self.queues.write().await;
-
-            *consume_channel = conn.create_channel().await?;
-            *produce_channel = conn.create_channel().await?;
-
-            queues.clear();
-            for (queue_name, queue_config) in &self.queue_declare_options {
-                let queue = consume_channel
-                    .queue_declare(
-                        queue_name.as_str().into(),
-                        queue_config.options,
-                        queue_config.into(),
-                    )
-                    .await?;
-                queues.insert(queue_name.into(), queue);
+        })
+        .await
+        {
+            Ok(Ok(res)) => Ok(res),
+            Ok(Err(err)) => Err(err),
+            Err(_) => {
+                warn!("reconnect error: timeout after {connection_timeout:?}");
+                Err(BrokerError::NotConnected)
             }
         }
-
-        Ok(())
     }
 
     #[cfg(test)]
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+}
+
+async fn basic_qos_with_timeout_and_recovery(
+    prefetch_count: u16,
+    channel: &Channel,
+    timeout: Duration,
+) -> Result<(), BrokerError> {
+    match tokio::time::timeout(timeout, async move {
+        loop {
+            if let Err(err) = channel
+                .basic_qos(prefetch_count, BasicQosOptions { global: true })
+                .await
+            {
+                warn!("basic_qos error: {err:#}");
+                channel.wait_for_recovery(err).await?;
+            } else {
+                break Ok(());
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(err)) => Err(err),
+        Err(_) => {
+            warn!("basic_qos error: timeout after {timeout:?}");
+            Err(BrokerError::NotConnected)
+        }
+    }
+}
+
+async fn basic_cancel_with_timeout_and_recovery(
+    consumer_tag: &str,
+    channel: &Channel,
+    timeout: Duration,
+) -> Result<(), BrokerError> {
+    match tokio::time::timeout(timeout, async move {
+        loop {
+            if let Err(err) = channel
+                .basic_cancel(consumer_tag.into(), BasicCancelOptions::default())
+                .await
+            {
+                warn!("basic_cancel error: {err:#}");
+                channel.wait_for_recovery(err).await?;
+            } else {
+                break Ok(());
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(err)) => Err(err),
+        Err(_) => {
+            warn!("basic_cancel error: timeout after {timeout:?}");
+            Err(BrokerError::NotConnected)
+        }
+    }
+}
+
+async fn basic_consume_with_timeout_and_recovery(
+    queue: &str,
+    consumer_tag: &str,
+    options: BasicConsumeOptions,
+    arguments: FieldTable,
+    channel: &Channel,
+    timeout: Duration,
+) -> Result<lapin::Consumer, BrokerError> {
+    match tokio::time::timeout(timeout, async move {
+        loop {
+            match channel
+                .basic_consume(
+                    queue.into(),
+                    consumer_tag.into(),
+                    options,
+                    arguments.clone(),
+                )
+                .await
+            {
+                Err(err) => {
+                    warn!("basic_consume error: {err:#}");
+                    channel.wait_for_recovery(err).await?;
+                }
+                Ok(consumer) => {
+                    break Ok(consumer);
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(err)) => Err(err),
+        Err(_) => {
+            warn!("basic_consume error: timeout after {timeout:?}");
+            Err(BrokerError::NotConnected)
+        }
+    }
+}
+
+async fn basic_publish_with_timeout_and_recovery(
+    exchange: &str,
+    routing_key: &str,
+    options: BasicPublishOptions,
+    payload: &[u8],
+    properties: BasicProperties,
+    channel: &Channel,
+    timeout: Duration,
+) -> Result<(), BrokerError> {
+    match tokio::time::timeout(timeout, async move {
+        loop {
+            match channel
+                .basic_publish(
+                    exchange.into(),
+                    routing_key.into(),
+                    options,
+                    payload,
+                    properties.clone(),
+                )
+                .await
+            {
+                Err(err) => {
+                    warn!("basic_publish error: {err:#}");
+                    channel.wait_for_recovery(err).await?;
+                }
+                Ok(publisher_confirm) => match publisher_confirm.await {
+                    Ok(Confirmation::NotRequested) => {
+                        break Ok(());
+                    }
+                    Ok(Confirmation::Ack(msg)) => {
+                        if let Some(msg) = msg {
+                            warn!(
+                                "basic_publish ack reply (unroutable?): code={}, text={}",
+                                msg.reply_code, msg.reply_text
+                            );
+                        }
+                        break Ok(());
+                    }
+                    Ok(Confirmation::Nack(None)) => {}
+                    Ok(Confirmation::Nack(Some(msg))) => {
+                        warn!(
+                            "basic_publish nack reply: code={}, text={}",
+                            msg.reply_code, msg.reply_text
+                        );
+                    }
+                    Err(err) => {
+                        warn!("basic_publish publisher_confirm error: {err:#}");
+                        channel.wait_for_recovery(err).await?;
+                    }
+                },
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(err)) => Err(err),
+        Err(_) => {
+            warn!("basic_publish error: timeout after {timeout:?}");
+            Err(BrokerError::NotConnected)
+        }
     }
 }
 

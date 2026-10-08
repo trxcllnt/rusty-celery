@@ -486,11 +486,6 @@ impl Broker for RedisBroker {
         let mut conn = self.manager.clone();
         loop {
             if connection_attempts < connection_max_retries {
-                error!(
-                    "Failed to establish connection with broker, trying again in {connection_retry_delay:?}..."
-                );
-                tokio::time::sleep(connection_retry_delay).await;
-
                 connection_attempts += 1;
                 let err = match tokio::time::timeout(
                     connection_timeout,
@@ -508,6 +503,10 @@ impl Broker for RedisBroker {
                     Ok(Err(err)) => format!("{err:#}"),
                 };
                 error!("Broker connection failed: {err}");
+                error!(
+                    "Failed to establish connection with broker, trying again in {connection_retry_delay:?}..."
+                );
+                tokio::time::sleep(connection_retry_delay).await;
                 continue;
             } else {
                 self.prefetch_count

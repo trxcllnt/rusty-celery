@@ -820,7 +820,7 @@ impl Celery {
                                 if let Some(err) = err.to_broker_error() {
                                     if err.is_connection_error() {
                                         error!("Received broker connection delivery error: {err}");
-                                        return Err(err.into());
+                                        broker_error_tx.try_send(err).ok();
                                     }
                                 } else {
                                     error!("Received delivery error: {err}");
@@ -848,6 +848,13 @@ impl Celery {
                 maybe_broker_error = broker_error_rx.recv() => {
                     if let Some(err) = maybe_broker_error {
                         error!("Received broker error: {err}");
+
+                        // Cancel consumers.
+                        for consumer_tag in consumer_tags {
+                            debug!("Cancelling consumer {consumer_tag}");
+                            let _ = self.broker.cancel(&consumer_tag).await;
+                        }
+
                         return Err(err.into());
                     }
                 }
@@ -859,7 +866,7 @@ impl Celery {
 
         // Cancel consumers.
         for consumer_tag in consumer_tags {
-            debug!("Cancelling consumer {}", consumer_tag);
+            debug!("Cancelling consumer {consumer_tag}");
             self.broker.cancel(&consumer_tag).await?;
         }
 

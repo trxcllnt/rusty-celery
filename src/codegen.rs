@@ -163,7 +163,7 @@ macro_rules! app {
             [ $( $t ),* ],
             [ $( $pattern => $queue ),* ],
             $( $x = $y, )*
-        );
+        )
     };
 }
 
@@ -331,7 +331,7 @@ macro_rules! beat {
             ),* ],
             [ $( $pattern => $queue ),* ],
             $( $x = $y, )*
-        );
+        )
     };
     (
         broker = $broker_type:ty { $broker_url:expr },
