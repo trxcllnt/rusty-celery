@@ -300,6 +300,7 @@ impl BrokerBuilder for AMQPBrokerBuilder {
             queues,
             // queue_declare_options: self.config.queues.clone(),
             prefetch_count: Mutex::new(self.config.prefetch_count),
+            attempt_recovery: connection_max_retries > 0,
             recovery_timeout: connection_timeout,
         };
         broker
@@ -330,6 +331,8 @@ pub struct AMQPBroker {
     /// mutability.
     prefetch_count: Mutex<u16>,
 
+    /// Whether error recovery is attempted. True if connection_max_retries > 0.
+    attempt_recovery: bool,
     /// Timeout to wait for error recovery. The same as the Builder's connection timeout.
     recovery_timeout: Duration,
 }
@@ -340,6 +343,7 @@ impl AMQPBroker {
         basic_qos_with_timeout_and_recovery(
             prefetch_count,
             &self.consume_channel,
+            self.attempt_recovery,
             self.recovery_timeout,
         )
         .await
@@ -379,6 +383,7 @@ impl Broker for AMQPBroker {
             BasicConsumeOptions::default(),
             FieldTable::default(),
             &self.consume_channel,
+            self.attempt_recovery,
             self.recovery_timeout,
         )
         .await?;
@@ -391,19 +396,24 @@ impl Broker for AMQPBroker {
                 error_handler: {
                     let channel = self.consume_channel.clone();
                     let timeout = self.recovery_timeout;
+                    let attempt = self.attempt_recovery;
                     Box::new(move |error| {
                         let channel = channel.clone();
                         async move {
                             warn!("consumer error: {error:#}");
-                            match tokio::time::timeout(
-                                timeout,
-                                channel.wait_for_recovery(error.clone()),
-                            )
-                            .await
-                            {
-                                Err(_) => Err(error),
-                                Ok(Ok(res)) => Ok(res),
-                                Ok(Err(err)) => Err(err),
+                            if attempt {
+                                match tokio::time::timeout(
+                                    timeout,
+                                    channel.wait_for_recovery(error.clone()),
+                                )
+                                .await
+                                {
+                                    Err(_) => Err(error),
+                                    Ok(Ok(res)) => Ok(res),
+                                    Ok(Err(err)) => Err(err),
+                                }
+                            } else {
+                                Err(error)
                             }
                         }
                     })
@@ -416,6 +426,7 @@ impl Broker for AMQPBroker {
         basic_cancel_with_timeout_and_recovery(
             consumer_tag,
             &self.consume_channel,
+            self.attempt_recovery,
             self.recovery_timeout,
         )
         .await
@@ -448,6 +459,7 @@ impl Broker for AMQPBroker {
             &message.raw_body,
             properties,
             &self.produce_channel,
+            self.attempt_recovery,
             self.recovery_timeout,
         )
         .await
@@ -554,6 +566,7 @@ impl Broker for AMQPBroker {
 async fn basic_qos_with_timeout_and_recovery(
     prefetch_count: u16,
     channel: &Channel,
+    recover: bool,
     timeout: Duration,
 ) -> Result<(), BrokerError> {
     match tokio::time::timeout(timeout, async move {
@@ -563,7 +576,11 @@ async fn basic_qos_with_timeout_and_recovery(
                 .await
             {
                 warn!("basic_qos error: {err:#}");
-                channel.wait_for_recovery(err).await?;
+                if recover {
+                    channel.wait_for_recovery(err).await?;
+                } else {
+                    break Err(err.into());
+                }
             } else {
                 break Ok(());
             }
@@ -583,6 +600,7 @@ async fn basic_qos_with_timeout_and_recovery(
 async fn basic_cancel_with_timeout_and_recovery(
     consumer_tag: &str,
     channel: &Channel,
+    recover: bool,
     timeout: Duration,
 ) -> Result<(), BrokerError> {
     match tokio::time::timeout(timeout, async move {
@@ -592,7 +610,11 @@ async fn basic_cancel_with_timeout_and_recovery(
                 .await
             {
                 warn!("basic_cancel error: {err:#}");
-                channel.wait_for_recovery(err).await?;
+                if recover {
+                    channel.wait_for_recovery(err).await?;
+                } else {
+                    break Err(err.into());
+                }
             } else {
                 break Ok(());
             }
@@ -615,6 +637,7 @@ async fn basic_consume_with_timeout_and_recovery(
     options: BasicConsumeOptions,
     arguments: FieldTable,
     channel: &Channel,
+    recover: bool,
     timeout: Duration,
 ) -> Result<lapin::Consumer, BrokerError> {
     match tokio::time::timeout(timeout, async move {
@@ -630,7 +653,11 @@ async fn basic_consume_with_timeout_and_recovery(
             {
                 Err(err) => {
                     warn!("basic_consume error: {err:#}");
-                    channel.wait_for_recovery(err).await?;
+                    if recover {
+                        channel.wait_for_recovery(err).await?;
+                    } else {
+                        break Err(err.into());
+                    }
                 }
                 Ok(consumer) => {
                     break Ok(consumer);
@@ -649,6 +676,7 @@ async fn basic_consume_with_timeout_and_recovery(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn basic_publish_with_timeout_and_recovery(
     exchange: &str,
     routing_key: &str,
@@ -656,6 +684,7 @@ async fn basic_publish_with_timeout_and_recovery(
     payload: &[u8],
     properties: BasicProperties,
     channel: &Channel,
+    recover: bool,
     timeout: Duration,
 ) -> Result<(), BrokerError> {
     match tokio::time::timeout(timeout, async move {
@@ -672,7 +701,11 @@ async fn basic_publish_with_timeout_and_recovery(
             {
                 Err(err) => {
                     warn!("basic_publish error: {err:#}");
-                    channel.wait_for_recovery(err).await?;
+                    if recover {
+                        channel.wait_for_recovery(err).await?;
+                    } else {
+                        break Err(err.into());
+                    }
                 }
                 Ok(publisher_confirm) => match publisher_confirm.await {
                     Ok(Confirmation::NotRequested) => {
